@@ -1231,6 +1231,9 @@ class LeRobotSingleDataset(Dataset):
         tag_stats["num_transitions"] = len(self)
         tag_stats["num_trajectories"] = len(self.trajectory_ids)
         
+        if self.data_cfg and self.data_cfg.get("action_contract") == "sonic_dex1_v1":
+            from DiT4DiT.dataloader.gr00t_lerobot.sonic_normalization import mark_statistics
+            mark_statistics(tag_stats["action"])
         statistics_data[tag] = tag_stats
         
         # Save as JSON file
@@ -2177,6 +2180,9 @@ class LeRobotMixtureDataset(Dataset):
             # Add dataset counts
             tag_stats.update(self._get_dataset_counts(tag))
             
+            if self.data_cfg and self.data_cfg.get("action_contract") == "sonic_dex1_v1":
+                from DiT4DiT.dataloader.gr00t_lerobot.sonic_normalization import mark_statistics
+                mark_statistics(tag_stats["action"])
             statistics_data[tag] = tag_stats
         
         # Save file

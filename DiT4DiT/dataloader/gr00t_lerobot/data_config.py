@@ -1072,7 +1072,24 @@ class UnitreeG1AlohaFullBodyDataConfig(UnitreeG1DataConfig):
 
 
 
+class UnitreeG1SonicDex1DataConfig(UnitreeG1DataConfig):
+    """31 raw continuous state values; 64 SONIC tokens + two motor targets."""
+    video_keys = ["video.ego_view"]
+    state_keys = ["state.body", "state.left_gripper", "state.right_gripper"]
+    action_keys = ["action.motion_token", "action.left_gripper", "action.right_gripper"]
+    observation_indices = [0]
+    action_indices = list(range(50))
+
+    def transform(self):
+        return ComposedModalityTransform(transforms=[
+            StateActionToTensor(apply_to=self.state_keys + self.action_keys),
+            StateActionTransform(apply_to=self.state_keys + self.action_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys + self.action_keys}),
+        ])
+
+
 ROBOT_TYPE_CONFIG_MAP = {
+    "g1_sonic_dex1": UnitreeG1SonicDex1DataConfig(),
     "libero_franka": Libero4in1DataConfig(),
     "oxe_droid": OxeDroidDataConfig(),
     "oxe_bridge": OxeBridgeDataConfig(),

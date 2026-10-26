@@ -189,6 +189,9 @@ class baseframework(PreTrainedModel):
         Returns:
             np.ndarray: Unnormalized actions (same shape as input).
         """
+        if action_norm_stats.get("action_contract") == "sonic_dex1_v1":
+            from DiT4DiT.dataloader.gr00t_lerobot.sonic_normalization import unnormalize_sonic_actions
+            return unnormalize_sonic_actions(normalized_actions, action_norm_stats)
         mask = action_norm_stats.get("mask", np.ones_like(action_norm_stats["q01"], dtype=bool))
         action_high, action_low = np.array(action_norm_stats["q99"]), np.array(action_norm_stats["q01"])
         normalized_actions = np.clip(normalized_actions, -1, 1)

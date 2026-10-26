@@ -397,6 +397,9 @@ DATASET_NAMED_MIXTURES = {
         ("stack_cups", 1.0, "g1_body29_aloha_arms_only"),
         ("packaging", 1.0, "g1_body29_aloha_arms_only"),
     ],
+    "g1_sonic_dex1": [
+        ("block_into_cup_v1_1_dex1_dit4dit", 1.0, "g1_sonic_dex1"),
+    ],
     "g1_decoupled_wbc": [
         ("your_g1_dataset_name", 1.0, "g1_body29_aloha_full_body"),
     ]
