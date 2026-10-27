@@ -19,7 +19,6 @@ import re
 # Third-Party Libraries
 import torch
 import torch.distributed as dist
-import wandb
 import yaml
 from accelerate import Accelerator, DeepSpeedPlugin
 from accelerate.logging import get_logger
@@ -29,6 +28,7 @@ from tqdm import tqdm
 from transformers import AutoProcessor, get_scheduler
 
 # Local Modules
+from DiT4DiT.training.trainer_utils.metric_logger import MetricLogger
 from DiT4DiT.training.trainer_utils.trainer_tools import normalize_dotlist_args
 from DiT4DiT.model.framework import build_framework
 from DiT4DiT.training.trainer_utils.trainer_tools import TrainerUtils
@@ -221,7 +221,7 @@ class VLATrainer(TrainerUtils):
             self.vla_train_dataloader,
         )
 
-        self._init_wandb()
+        self._init_trackers()
 
 
     def _adjust_lr_scheduler_for_resume(self):
@@ -247,16 +247,13 @@ class VLATrainer(TrainerUtils):
             * self.accelerator.gradient_accumulation_steps
         )
 
-    def _init_wandb(self):
-        """initialize Weights & Biases"""
-        if self.accelerator.is_main_process:
-            wandb.init(
-                name=self.config.run_id,
-                dir=os.path.join(self.config.output_dir, "wandb"),
-                project=self.config.wandb_project,
-                entity=self.config.wandb_entity,
-                group="vla-train",
-            )
+    def _init_trackers(self):
+        self.metric_logger = MetricLogger(self.config, self.accelerator.is_main_process)
+
+    def _close_trackers(self):
+        metric_logger = getattr(self, "metric_logger", None)
+        if metric_logger is not None:
+            metric_logger.close()
 
     def _init_checkpointing(self):
         """Initialize checkpoint directory and handle checkpoint loading."""
@@ -341,8 +338,8 @@ class VLATrainer(TrainerUtils):
                 # add epoch info
                 metrics["epoch"] = round(self.completed_steps * self.config.trainer.gradient_accumulation_steps  / len(self.vla_train_dataloader), 2)
 
-                # record to W&B
-                wandb.log(metrics, step=self.completed_steps)
+                # Record the same metrics to the configured backends.
+                self.metric_logger.log(metrics, step=self.completed_steps)
                 # debug output
                 logger.info(f"[Exp: {self.config.run_id}] Step {self.completed_steps}, Loss: {metrics})")
 
@@ -565,9 +562,7 @@ class VLATrainer(TrainerUtils):
             logger.info(f"Training complete. Final model saved at {final_checkpoint}")
 
 
-        # close W&B
-        if self.accelerator.is_main_process:
-            wandb.finish()
+        self._close_trackers()
 
         self.accelerator.wait_for_everyone()
 
@@ -600,10 +595,11 @@ def main(cfg) -> None:
         accelerator=accelerator,
     )
 
-    # execute training preparation
-    trainer.prepare_training()
-    # execute training
-    trainer.train()
+    try:
+        trainer.prepare_training()
+        trainer.train()
+    finally:
+        trainer._close_trackers()
 
     # And... we're done!
     logger.info("... and that's all, folks!")

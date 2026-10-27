@@ -1,7 +1,7 @@
 run_id: dit4dit_sonic_dex1
 run_root_dir: results/Checkpoints
 seed: 42
-trackers: [jsonl, wandb]
+trackers: [jsonl, wandb, tensorboard]
 wandb_entity: your_wandb_entity
 wandb_project: DiT4DiT
 is_debug: false
