@@ -5,3 +5,11 @@ __pycache__/
 
 /datasets/
 /models/
+
+
+# 本机服务器配置
+/DiT4DiT/config/real_robot/dit4dit_sonic_dex1_server*.yaml
+
+# 训练日志和输出
+/logs/
+/results/Checkpoints/
