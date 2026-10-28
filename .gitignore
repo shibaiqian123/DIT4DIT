@@ -13,3 +13,5 @@ __pycache__/
 # 训练日志和输出
 /logs/
 /results/Checkpoints/
+
+/results
