@@ -20,6 +20,47 @@ def sha(path):
     return h.hexdigest()
 
 
+# Calibrated command-open endpoints (full-open feedback endpoint minus 0.05 rad).
+# Fixed order: left, right. Existing robot-side controller remains responsible
+# for endpoint braking, obstruction handling and feedback validity.
+DEX1_OPEN_TARGETS = (5.30725, 5.33774)
+DEX1_BINARY_THRESHOLD = 0.5
+
+
+def binary_gripper_mode(action_stats, configured=None):
+    """Validate the training label contract before interpreting scores as intent."""
+    enabled = 'dex1_label_encoding' in action_stats
+    if configured is not None and enabled != configured:
+        raise ValueError('Dex1 binary config/statistics mismatch')
+    if not enabled:
+        return False
+    encoding = action_stats['dex1_label_encoding']
+    if (not isinstance(encoding, dict) or
+            encoding.get('source') != 'teleop.dex1_trigger' or
+            encoding.get('open') != 0 or encoding.get('closed') != 1):
+        raise ValueError('Unsupported Dex1 binary label encoding')
+    lo = np.asarray(action_stats.get('min', []))
+    hi = np.asarray(action_stats.get('max', []))
+    if (lo.shape != (66,) or hi.shape != (66,) or
+            not np.array_equal(lo[-2:], [0., 0.]) or
+            not np.array_equal(hi[-2:], [1., 1.])):
+        raise ValueError('Dex1 binary action statistics require final min=0, max=1')
+    return True
+
+
+def gripper_motor_targets(actions, action_stats):
+    """Convert only denormalized binary grip scores; never mutate RTC actions."""
+    actions = np.asarray(actions)
+    if actions.shape != (50, 66) or not np.isfinite(actions).all():
+        raise ValueError('Expected finite denormalized actions[50,66]')
+    grips = actions[:, 64:66]
+    if not binary_gripper_mode(action_stats):
+        return grips.copy()
+    if np.any((grips < 0) | (grips > 1)):
+        raise ValueError('Denormalized binary gripper scores must be in [0,1]')
+    return np.where(grips >= DEX1_BINARY_THRESHOLD, 0., np.asarray(DEX1_OPEN_TARGETS))
+
+
 class Policy:
     def __init__(self, run, checkpoint, cosmos, seed=42):
         from omegaconf import OmegaConf
@@ -34,6 +75,8 @@ class Policy:
                 cfg.framework.action_model.action_horizon) != (66,31,50):
             raise ValueError('Expected trained SONIC 31-state / 50x66 contract')
         self.stats = json.loads((run/'dataset_statistics.json').read_text())['new_embodiment']
+        binary_grippers = binary_gripper_mode(
+            self.stats['action'], bool(cfg.datasets.vla_data.get('dex1_binary_gripper', False)))
         self.unnormalize = unnormalize_sonic_actions
         self.unnormalize(np.zeros((50,66)), self.stats['action'])
         cfg.framework.cosmos25.base_model = str(Path(cosmos).resolve())
@@ -49,7 +92,11 @@ class Policy:
                          config_sha256=sha(run/'config.yaml'), statistics_sha256=sha(run/'dataset_statistics.json'),
                          cosmos=str(Path(cosmos).resolve()), action_shape=[50,66], token_shape=[50,64],
                          state_dim=31, inference_steps=self.model.action_model.num_inference_timesteps,
-                         rtc_mode='test_time', guidance_alpha=0.9, seed=seed)
+                         rtc_mode='test_time', guidance_alpha=0.9, seed=seed,
+                         gripper_output_units='motor_output_radians',
+                         gripper_label_mode='binary' if binary_grippers else 'continuous',
+                         gripper_binary_threshold=DEX1_BINARY_THRESHOLD if binary_grippers else None,
+                         gripper_open_targets=list(DEX1_OPEN_TARGETS) if binary_grippers else None)
 
     def example(self, obs):
         state = np.asarray(obs['state'], dtype=np.float32)
@@ -91,7 +138,8 @@ class Policy:
         actions = self.unnormalize(norm, self.stats['action'])
         if not np.isfinite(actions).all():
             raise ValueError('Nonfinite denormalized actions')
+        grips = gripper_motor_targets(actions, self.stats['action'])
         torch.cuda.synchronize()
         return dict(normalized=norm.tolist(), motion_tokens=actions[:,:64].tolist(),
-                    gripper_actions=actions[:,64:].tolist(), inference_seconds=time.monotonic()-start,
+                    gripper_actions=grips.tolist(), inference_seconds=time.monotonic()-start,
                     out_of_range_fraction=float((np.abs(norm)>1).mean()))

@@ -28,10 +28,12 @@ min/max are fixed to 0/1 even for a constant hand, so the existing min-max
 transform produces -1/+1. Exported statistics record `dex1_label_encoding`;
 `binary_indices` remains empty because training retains continuous regression.
 
-This change implements data loading only. The model architecture, loss and
-inference adapters are unchanged. A model trained with this option must not be
-used with the existing motor-radian inference adapter until binary thresholding
-and 0/1-to-radian conversion are implemented.
+The model architecture and loss are unchanged. The updated inference adapter
+recognizes the binary marker and converts denormalized scores to open/closed
+motor targets; see ../rtc_deploy/BINARY_GRIPPER.md. Deploy that adapter to the
+actual inference server before using a binary-trained checkpoint. RTC here is
+test-time action-chunk guidance, not a change to training. Real checkpoint and
+hardware validation remain outstanding.
 
 CPU verification (no model/GPU):
 
