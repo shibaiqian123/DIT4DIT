@@ -157,6 +157,21 @@ class LeRobotSingleDataset(Dataset):
 
         self.delete_pause_frame = delete_pause_frame
 
+        self.dex1_binary_gripper = bool(self.data_cfg.get("dex1_binary_gripper", False))
+        self.dex1_open_threshold = float(self.data_cfg.get("dex1_open_threshold", 0.2))
+        self.dex1_close_threshold = float(self.data_cfg.get("dex1_close_threshold", 0.8))
+        self._dex1_binary_episode_id = None
+        self._dex1_binary_labels = None
+        if self.dex1_binary_gripper:
+            if self.data_cfg.get("action_contract") != "sonic_dex1_v1" or self._lerobot_version != "v2.0":
+                raise ValueError("Dex1 binary labels require the SONIC v2 episode loader")
+            if delete_pause_frame:
+                raise ValueError("Dex1 binary labels require delete_pause_frame=false")
+            if modality_configs["action"].modality_keys != ["action.motion_token", "action.left_gripper", "action.right_gripper"]:
+                raise ValueError("Dex1 binary labels require token64, left, right action order")
+            if not 0 <= self.dex1_open_threshold < self.dex1_close_threshold <= 1:
+                raise ValueError("Require 0 <= Dex1 open threshold < close threshold <= 1")
+
         # Allow config-time overrides (useful for future-frame supervision / multi-frame conditioning)
         # Example: cfg.datasets.vla_data.video_delta_indices: [0, 1]
         if self.data_cfg is not None:
@@ -399,6 +414,12 @@ class LeRobotSingleDataset(Dataset):
                     )
                     stat = np.array(le_statistics[le_modality][stat_name])
                     dataset_statistics[our_modality][subkey][stat_name] = stat[indices].tolist()
+
+        if self.dex1_binary_gripper:
+            from .dex1_binary import label_statistics
+            # Override only the in-memory action statistics, never stats_gr00t.json.
+            dataset_statistics["action"].update(label_statistics(
+                self.dataset_path, self.dex1_open_threshold, self.dex1_close_threshold))
 
         # 3. Full dataset metadata
         metadata = DatasetMetadata(
@@ -1041,6 +1062,16 @@ class LeRobotSingleDataset(Dataset):
         assert key.startswith(modality + "."), f"{key} must start with {modality + '.'}, got {key}"
         # Get the sub-key, e.g. state.joint_angles -> joint_angles
         key = key.replace(modality + ".", "")
+        if self.dex1_binary_gripper and modality == "action" and key in ("left_gripper", "right_gripper"):
+            from .dex1_binary import episode_labels
+            if self._dex1_binary_episode_id != trajectory_id:
+                self._dex1_binary_labels = episode_labels(
+                    self.curr_traj_data, self.dex1_open_threshold, self.dex1_close_threshold)
+                self._dex1_binary_episode_id = trajectory_id
+            side = 0 if key == "left_gripper" else 1
+            return self.retrieve_data_and_pad(
+                array=self._dex1_binary_labels[:, side:side + 1],
+                step_indices=step_indices, max_length=max_length, padding_strategy="first_last")
         # Get the lerobot key
         le_state_or_action_cfg = getattr(self.lerobot_modality_meta, modality)
         le_key = le_state_or_action_cfg[key].original_key
@@ -1234,6 +1265,13 @@ class LeRobotSingleDataset(Dataset):
         if self.data_cfg and self.data_cfg.get("action_contract") == "sonic_dex1_v1":
             from DiT4DiT.dataloader.gr00t_lerobot.sonic_normalization import mark_statistics
             mark_statistics(tag_stats["action"])
+            if self.data_cfg.get("dex1_binary_gripper", False):
+                tag_stats["action"]["dex1_label_encoding"] = {
+                    "source": "teleop.dex1_trigger", "open": 0, "closed": 1,
+                    "open_threshold": float(self.data_cfg.get("dex1_open_threshold", 0.2)),
+                    "close_threshold": float(self.data_cfg.get("dex1_close_threshold", 0.8)),
+                    "initial_state": "threshold_midpoint",
+                }
         statistics_data[tag] = tag_stats
         
         # Save as JSON file
@@ -2183,6 +2221,13 @@ class LeRobotMixtureDataset(Dataset):
             if self.data_cfg and self.data_cfg.get("action_contract") == "sonic_dex1_v1":
                 from DiT4DiT.dataloader.gr00t_lerobot.sonic_normalization import mark_statistics
                 mark_statistics(tag_stats["action"])
+                if self.data_cfg.get("dex1_binary_gripper", False):
+                    tag_stats["action"]["dex1_label_encoding"] = {
+                        "source": "teleop.dex1_trigger", "open": 0, "closed": 1,
+                        "open_threshold": float(self.data_cfg.get("dex1_open_threshold", 0.2)),
+                        "close_threshold": float(self.data_cfg.get("dex1_close_threshold", 0.8)),
+                        "initial_state": "threshold_midpoint",
+                    }
             statistics_data[tag] = tag_stats
         
         # Save file
@@ -2263,6 +2308,8 @@ class LeRobotMixtureDataset(Dataset):
         Args:
             cached_statistics (dict): Statistics loaded from file
         """
+        if self.data_cfg and self.data_cfg.get("dex1_binary_gripper", False):
+            raise ValueError("Recompute Dex1 binary statistics; cached statistics are not supported")
         # Validate that cached statistics match current datasets
         if "metadata" in cached_statistics:
             cached_dataset_names = set(cached_statistics["metadata"]["dataset_names"])
