@@ -74,6 +74,13 @@ datasets:
     action_video_freq_ratio: 2
 
 trainer:
+  kinematic_validation:
+    enabled: true
+    checkpoint: /home/cqu023/.cache/huggingface/hub/models--nvidia--GEAR-SONIC/snapshots/6733128a3d8a523b1418b06bca3cdf61c8b0987f/sonic_v1_1/last.pt
+    sonic_root: /home/cqu023/GR00T-WholeBodyControl
+    seed: 42
+    val_fraction: 0.1
+    max_windows: 256
   epochs: 100
   max_train_steps: 100000
   num_warmup_steps: 5000

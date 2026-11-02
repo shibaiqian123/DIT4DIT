@@ -20,3 +20,6 @@ __pycache__/
 /.venv_rtc_deploy/
 /rtc_deploy/capture_validation/
 /rtc_deploy/validation_checkpoint_v1/
+
+# Local offline kinematics validation environment
+/.venv_kinematic_eval/

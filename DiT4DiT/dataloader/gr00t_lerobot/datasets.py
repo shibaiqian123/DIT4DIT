@@ -1617,6 +1617,9 @@ class LeRobotMixtureDataset(Dataset):
 
     def sample_step(self, index: int) -> tuple[LeRobotSingleDataset, int, int]:
         """Sample a single step from the dataset."""
+        if hasattr(self, "_kinematic_windows"):
+            episode, step = self._kinematic_windows[index]
+            return self.datasets[0], episode, step
         # return self.sampled_steps[index]
 
         # Set seed
@@ -1660,6 +1663,8 @@ class LeRobotMixtureDataset(Dataset):
                     video_path = dataset.get_video_path(trajectory_id, key)
                     if os.path.exists(video_path):
                         break
+                    if hasattr(self, "_kinematic_windows"):
+                        raise FileNotFoundError(video_path)
                     index = random.randint(0, len(self) - 1)
                     
                 raw_data = dataset.get_step_data(trajectory_id, step)    
@@ -1816,9 +1821,20 @@ class LeRobotMixtureDataset(Dataset):
                     action_mask=action_mask,
                     state_mask=state_mask,
                 )
+                if hasattr(self, "_kinematic_windows"):
+                    length = int(dataset.trajectory_lengths[list(dataset.trajectory_ids).index(trajectory_id)])
+                    offsets = dataset.delta_indices[dataset.modality_keys["action"][0]]
+                    if len(offsets) != n_action_tokens:
+                        raise ValueError("Action horizon and delta indices differ")
+                    out["valid_time_mask"] = (step + offsets >= 0) & (step + offsets < length)
+                    out["episode_id"] = int(trajectory_id)
+                    out["start_frame"] = int(step)
+                    out["sample_id"] = f"{dataset.dataset_name}:{trajectory_id}:{step}"
                 return out
                 
             except Exception as e:
+                if hasattr(self, "_kinematic_windows"):
+                    raise
                 last_exception = e
                 if attempt < max_retries - 1:
                     # Log the error but continue trying

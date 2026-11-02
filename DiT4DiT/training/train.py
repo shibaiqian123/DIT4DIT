@@ -138,6 +138,8 @@ class VLATrainer(TrainerUtils):
     def __init__(self, cfg, model, vla_train_dataloader, optimizer, lr_scheduler, accelerator):
         self.config = cfg
         self.model = model
+        self.kinematic_validation_dataset = getattr(vla_train_dataloader, "kinematic_validation_dataset", None)
+        self.kinematic_evaluator = None
         self.vla_train_dataloader = vla_train_dataloader
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
@@ -329,7 +331,7 @@ class VLATrainer(TrainerUtils):
 
     def _log_metrics(self, metrics):
         """record training metrics"""
-        if self.completed_steps % self.config.trainer.logging_frequency == 0:
+        if self.completed_steps % self.config.trainer.logging_frequency == 0 or any(k.startswith("val/") for k in metrics):
             if dist.get_rank() == 0:
                 # add learning rate for each param group
                 for group, lr in zip(self.optimizer.param_groups, self.lr_scheduler.get_last_lr()):
@@ -434,6 +436,20 @@ class VLATrainer(TrainerUtils):
         :param metric_fn: Function to compute the distance between predicted and ground truth actions.
         :return: Average metric score across the evaluation dataset.
         """
+
+        if self.kinematic_validation_dataset is not None:
+            from DiT4DiT.evaluation.sonic_evaluator import SonicEvaluator
+            if self.kinematic_evaluator is None:
+                self.kinematic_evaluator = SonicEvaluator(
+                    self.config.trainer.kinematic_validation,
+                    self.kinematic_validation_dataset, self.config.output_dir)
+            values = self.kinematic_evaluator.run(
+                self.accelerator.unwrap_model(self.model), self.completed_steps,
+                writer=self.metric_logger.writer)
+            if step_metrics is None:
+                step_metrics = {}
+            step_metrics.update(values)
+            return step_metrics
 
         examples = self._get_next_batch()
         score = 0.0

@@ -123,7 +123,9 @@ class Cosmos25FeatureExtractor(nn.Module):
 
     @property
     def device(self) -> torch.device:
-        return next(self.parameters()).device
+        # Text encoder parameters may be on meta while CPU-offloaded.
+        # Latents and video features execute on the transformer device.
+        return next(self.transformer.parameters()).device
 
     @property
     def hidden_size(self) -> Optional[int]:

@@ -34,6 +34,10 @@ def save_dataset_statistics(dataset_statistics, run_dir):
 
 def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"):
 
+    if cfg.trainer.get("kinematic_validation", {}).get("enabled", False):
+        from DiT4DiT.evaluation.sonic_data import build_train_loader
+        return build_train_loader(cfg)
+
     if dataset_py == "lerobot_datasets":
         from DiT4DiT.dataloader.lerobot_datasets import get_vla_dataset, collate_fn
         vla_dataset_cfg = cfg.datasets.vla_data
