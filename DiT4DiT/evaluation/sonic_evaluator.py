@@ -19,7 +19,8 @@ class SonicEvaluator:
         self.statistics_path=Path(statistics_path or self.output_dir/'dataset_statistics.json')
         stats=json.loads(self.statistics_path.read_text())
         self.stats=stats['new_embodiment']['action']
-        self.decoder=SonicKinematicDecoder(config.checkpoint,config.sonic_root)
+        self.decoder=SonicKinematicDecoder(config.checkpoint,config.sonic_root,
+            eef_links=config.get('eef_links'), link_to_tcp=config.get('link_to_tcp'))
         self.metadata=dict(self.decoder.metadata, statistics_sha256=sha256(self.statistics_path),
             statistics_provenance=dataset.statistics_provenance,split=dataset.validation_manifest,
             metric_kind='decoded_label_kinematic_proxy',seed=int(config.seed),max_windows=len(dataset),

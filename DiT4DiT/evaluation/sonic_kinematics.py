@@ -9,6 +9,7 @@ import numpy as np
 import torch
 from torch import nn
 from omegaconf import OmegaConf
+from .sonic_reconstruction import parse_reconstruction, EndEffectorTransform
 from .sonic_token_adapter import restore_internal_tokens, decode_feature_dict
 
 OFFICIAL_SHA256 = 'af24831ae59424a0cf92cb56e9bb6dc1a59ab859fd055ba13187e9e6f0a59f43'
@@ -68,7 +69,7 @@ def quat_matrix(q):
 
 class G1ForwardKinematics(nn.Module):
     """MJCF tree FK in pelvis coordinates, with IsaacLab-ordered input joints."""
-    def __init__(self, xml_path, body_order):
+    def __init__(self, xml_path, body_order, link_names=None):
         super().__init__()
         tree = ET.parse(xml_path).getroot()
         if tree.find('compiler').get('angle', 'degree') != 'radian':
@@ -109,7 +110,12 @@ class G1ForwardKinematics(nn.Module):
         visit(root, -1)
         if set(seen) != set(body_order) or len(seen) != 29:
             raise ValueError('Skeleton and official DOF order differ')
-        self.wrists = [next(i for i,n in enumerate(self.nodes) if n[0] == side+'_wrist_yaw_link') for side in ('left','right')]
+        names = [n[0] for n in self.nodes]
+        selected = tuple(link_names) if link_names is not None else ('left_wrist_yaw_link', 'right_wrist_yaw_link')
+        if len(selected) != 2 or len(set(selected)) != 2 or any(n not in names for n in selected):
+            raise ValueError(f'Unknown or duplicate end-effector links: {selected}')
+        self.link_names = selected
+        self.wrists = [names.index(n) for n in selected]
         for key, value in [('positions',positions),('rotations',rotations),('axes',axes),('anchors',anchors)]:
             self.register_buffer(key, torch.tensor(value, dtype=torch.float32))
         self.axes /= self.axes.norm(dim=-1, keepdim=True)
@@ -142,7 +148,7 @@ class G1ForwardKinematics(nn.Module):
 
 
 class SonicKinematicDecoder(nn.Module):
-    def __init__(self, checkpoint, sonic_root, device='cpu'):
+    def __init__(self, checkpoint, sonic_root, device='cpu', *, eef_links=None, link_to_tcp=None):
         super().__init__()
         checkpoint, sonic_root = Path(checkpoint), Path(sonic_root)
         config_path = checkpoint.parent/'config.yaml'
@@ -188,7 +194,8 @@ class SonicKinematicDecoder(nn.Module):
         if asset != 'g1_29dof_rev_1_0.xml':
             raise ValueError('Unexpected training skeleton')
         skeleton = sonic_root/'gear_sonic/data/assets/robot_description/mjcf'/asset
-        self.fk = G1ForwardKinematics(skeleton, body_order)
+        self.end_effectors = EndEffectorTransform(eef_links, link_to_tcp)
+        self.fk = G1ForwardKinematics(skeleton, body_order, self.end_effectors.links)
         self.metadata = dict(checkpoint=str(checkpoint), checkpoint_sha256=digest,
             config_sha256=sha256(config_path), skeleton=str(skeleton), skeleton_sha256=sha256(skeleton),
             joint_order_sha256=sha256(order_path), reference_frame='pelvis', eef_reference='wrist_yaw_link',
@@ -197,6 +204,9 @@ class SonicKinematicDecoder(nn.Module):
             token_layout='[B,H,num_tokens,token_dim]; flat_index=n*token_dim+d',
             decoder_output_features=self.decoder_output_feature_dims,
             universal_token_source_sha256=sha256(sonic_root/'gear_sonic/trl/modules/universal_token_modules.py'))
+        self.metadata.update(self.end_effectors.metadata)
+        self.metadata.update(joint_order='IsaacLab', root_translation_m=[0.,0.,0.],
+                             root_quaternion_wxyz=[1.,0.,0.,0.], heading_used_for_root=False)
         self.to(device=device, dtype=torch.float32).requires_grad_(False).eval()
 
     def to_internal_tokens(self, tokens):
@@ -222,15 +232,13 @@ class SonicKinematicDecoder(nn.Module):
             return decode_feature_dict(self._decode_temporal, {'token': internal},
                                        self.decoder_input_features, self.decoder_output_feature_dims)
 
+    @torch.inference_mode()
+    def decode_reconstruction(self, tokens):
+        """Named qpos/qvel sequences and raw heading; no global-pose inference."""
+        return parse_reconstruction(self.decode_fields(tokens), self.frames, self.num_dofs)
+
     def decode_joints(self, tokens):
-        fields = self.decode_fields(tokens)
-        command = fields['command_multi_future_nonflat']
-        # Official producer concatenates ALL frame positions, then ALL frame
-        # velocities before reshaping into command rows. Split that named field,
-        # not the decoder's concatenated raw output.
-        command_flat = command.flatten(start_dim=-2)
-        positions, _velocities = command_flat.split(self.frames * self.num_dofs, dim=-1)
-        return positions.reshape(*command.shape[:-2], self.frames, self.num_dofs)
+        return self.decode_reconstruction(tokens).joint_positions
 
     @torch.inference_mode()
     def decode(self, tokens):
@@ -238,4 +246,4 @@ class SonicKinematicDecoder(nn.Module):
         if tokens.ndim != 3:
             raise ValueError('decode expects [B,T,64]')
         with torch.autocast(device_type=tokens.device.type, enabled=False):
-            return self.fk(self.decode_joints(tokens)[...,0,:])
+            return self.end_effectors(*self.fk(self.decode_joints(tokens)[...,0,:]))

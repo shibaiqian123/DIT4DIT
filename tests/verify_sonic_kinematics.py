@@ -87,5 +87,42 @@ for j,angles in enumerate(q):
         max_p=max(max_p,float(np.max(np.abs(data.xpos[bid]-pos[j,side].numpy()))))
         max_r=max(max_r,float(np.max(np.abs(data.xmat[bid].reshape(3,3)-rot[j,side].numpy()))))
 assert max_p<2e-6 and max_r<2e-6,(max_p,max_r)
-result=dict(status='CHECKPOINT_BASEMODULE_AND_FK_PARITY_OK',mlp_max_abs=float((actual-expected).abs().max()),fk_position_max_abs_m=max_p,fk_rotation_max_abs=max_r,metadata=m.metadata,official_decode_max_abs=field_errors,source_export_rows_equal=source_rows)
+# Selected alternative links and fixed TCP transforms against independent
+# MuJoCo body transforms, using homogeneous matrix composition as oracle.
+from DiT4DiT.evaluation.sonic_kinematics import G1ForwardKinematics
+from DiT4DiT.evaluation.sonic_reconstruction import EndEffectorTransform
+from scipy.spatial.transform import Rotation
+links = {'left':'left_wrist_roll_link', 'right':'right_wrist_roll_link'}
+calibration = {side:{'translation_m':[.07, -.02, .03],
+                    'quaternion_wxyz':[2**-.5, 0., 2**-.5, 0.]} for side in links}
+transform = EndEffectorTransform(links,calibration)
+fk_selected = G1ForwardKinematics(m.metadata['skeleton'],order,transform.links)
+p_tcp,r_tcp = transform(*fk_selected(q))
+tcp_error = 0.
+for j,angles in enumerate(q):
+    data.qpos[:]=0; data.qpos[3]=1
+    for i,name in enumerate(order):
+        body=mujoco.mj_name2id(model,mujoco.mjtObj.mjOBJ_BODY,name)
+        data.qpos[model.jnt_qposadr[model.body_jntadr[body]]]=angles[i].item()
+    mujoco.mj_forward(model,data)
+    for side,name in enumerate(transform.links):
+        bid=mujoco.mj_name2id(model,mujoco.mjtObj.mjOBJ_BODY,name)
+        world=np.eye(4); world[:3,:3]=data.xmat[bid].reshape(3,3); world[:3,3]=data.xpos[bid]
+        offset=np.eye(4); offset[:3,3]=[.07,-.02,.03]
+        offset[:3,:3]=Rotation.from_quat([0.,2**-.5,0.,2**-.5]).as_matrix()
+        expected_tcp=world@offset
+        tcp_error=max(tcp_error,float(np.max(np.abs(expected_tcp[:3,3]-p_tcp[j,side].numpy()))),
+                      float(np.max(np.abs(expected_tcp[:3,:3]-r_tcp[j,side].numpy()))))
+assert tcp_error < 2e-6,tcp_error
+reconstructed=m.decode_reconstruction(tokens)
+torch.testing.assert_close(reconstructed.joint_positions,m.decode_joints(tokens),atol=0,rtol=0)
+for a_default,b_default in zip(m.decode(tokens),m.fk(reconstructed.joint_positions[...,0,:])):
+    torch.testing.assert_close(a_default,b_default,atol=0,rtol=0)
+try:
+    G1ForwardKinematics(m.metadata['skeleton'],order,('missing_left','missing_right'))
+except ValueError:
+    pass
+else:
+    raise AssertionError('Missing links must fail explicitly')
+result=dict(selected_link_tcp_max_abs=tcp_error,status='CHECKPOINT_BASEMODULE_AND_FK_PARITY_OK',mlp_max_abs=float((actual-expected).abs().max()),fk_position_max_abs_m=max_p,fk_rotation_max_abs=max_r,metadata=m.metadata,official_decode_max_abs=field_errors,source_export_rows_equal=source_rows)
 Path(a.output).write_text(json.dumps(result,indent=2));print(json.dumps(result,indent=2))

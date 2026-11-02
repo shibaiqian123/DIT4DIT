@@ -130,3 +130,41 @@ MLP 只展平最后两个 token 轴；输出恢复时间维后才按字段拆分
 本次14项测试通过，官方命名字段最大差0，FK对照仍通过。结果：
 `results/sonic_kinematic_validation/token_adapter_parity.json`。
 本次第2步不重复执行完整 GPU 策略预测；验证的是实际 checkpoint 的解码与数据顺序，前一节的真实策略/TensorBoard验收属于第1步。
+
+### Reconstruction fields, selected links and optional TCP (step 3)
+
+`decode_reconstruction(tokens)` returns `joint_positions` and `joint_velocities`
+`[B,H,10,29]` in IsaacLab order, plus the untouched heading first-two-column
+representation `[B,H,10,6]`. The named command field must be flattened and split
+into ALL positions followed by ALL velocities, not split each 58-wide row.
+This matches the temporal-bug workaround in official
+`decoder_output_to_egocentric_transforms`. The official `G1JointPositionLoss`
+and `G1JointRotationLoss` exist and call that helper; its generic old `ori_b`
+field gate cannot directly parse the matched v1.1 `ori_heading` output.
+
+`decode(tokens)` still selects frame zero and returns `[B,H,2,3]` positions
+and `[B,H,2,3,3]` matrices. FK uses body names to map IsaacLab joint slots to
+MJCF tree joints, equivalent to the conversion script's `dof_mj = q[:,MJ_TO_IL]`.
+Root translation is zero and quaternion is identity **wxyz**. Heading is not
+used to reconstruct world trajectories. Default link origins are left/right
+`wrist_yaw_link`, not Dex1 TCP.
+
+`trainer.kinematic_validation.eef_links` selects named left/right MJCF bodies.
+Optional `link_to_tcp` must contain both `left` and `right`, each with
+`translation_m: [x,y,z]` and `quaternion_wxyz: [w,x,y,z]`. The quaternion must
+be unit length. Translation is TCP origin in the selected link coordinates;
+rotation maps TCP axes into link axes. Composition is
+`p_tcp = p_link + R_link @ translation_m`, `R_tcp = R_link @ R_link_tcp`.
+No Dex1 calibration is supplied or assumed. Set `link_to_tcp: null` for link
+origins. Use a separate output/log directory when changing link/TCP definitions.
+Metadata records selected links, explicit transforms, root convention and
+`eef_reference`; the same configuration is used for predicted and label tokens.
+Offline evaluation accepts this through its existing `--evaluation-config`.
+
+Step 3 validation: all 17 unit tests passed. Real v1.1 output field parity
+remains exact; 38,333 source/export token rows agree. MuJoCo wrist position
+max difference: 4.7552e-8 m; rotation matrix: 2.0403e-7. Selected wrist-roll
+links and synthetic TCP offsets: max component difference 2.8516e-7.
+Report: `results/sonic_kinematic_validation/reconstruction_fk_parity.json`.
+Default decode output is exactly unchanged. Full DiT prediction was not
+rerun for this step. Synthetic offsets are not hardware TCP calibration.

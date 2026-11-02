@@ -79,6 +79,10 @@ trainer:
     checkpoint: /home/cqu023/.cache/huggingface/hub/models--nvidia--GEAR-SONIC/snapshots/6733128a3d8a523b1418b06bca3cdf61c8b0987f/sonic_v1_1/last.pt
     sonic_root: /home/cqu023/GR00T-WholeBodyControl
     seed: 42
+    eef_links:
+      left: left_wrist_yaw_link
+      right: right_wrist_yaw_link
+    link_to_tcp: null  # Optional explicit transforms; see validation documentation.
     val_fraction: 0.1
     max_windows: 256
   epochs: 100
