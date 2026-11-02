@@ -9,6 +9,7 @@ import numpy as np
 import torch
 from torch import nn
 from omegaconf import OmegaConf
+from .sonic_token_adapter import restore_internal_tokens, decode_feature_dict
 
 OFFICIAL_SHA256 = 'af24831ae59424a0cf92cb56e9bb6dc1a59ab859fd055ba13187e9e6f0a59f43'
 PREFIX = 'actor_module.decoders.g1_kin.module.'
@@ -154,10 +155,28 @@ class SonicKinematicDecoder(nn.Module):
             or layer.type != 'MLP' or layer.activation != 'SiLU' or list(layer.hidden_dims) != [2048,1024,512,512]
             or int(backbone.max_num_tokens) != 2 or int(backbone.num_fsq_levels) != 32 or frames != 10):
             raise ValueError('Unsupported SONIC v1.1 configuration')
+        if not dec.has_temporal_dim or dec.get('conds', []) or dec.get('mask', []):
+            raise ValueError('Unsupported g1_kin conditioning or temporal contract')
         self.frames = frames
+        self.token_dim = int(backbone.num_fsq_levels)
+        self.max_num_tokens = int(backbone.max_num_tokens)
+        self.token_total_dim = self.token_dim * self.max_num_tokens
+        if (int(dec.params.num_input_temporal_dims) != self.max_num_tokens
+                or int(dec.params.num_output_temporal_dims) != self.frames):
+            raise ValueError('BaseModule temporal dimensions differ from token configuration')
+        order_path = sonic_root/'gear_sonic/envs/manager_env/robots/g1.py'
+        body_order = official_body_order(order_path)
+        self.num_dofs = len(body_order)
+        # Widths follow the actual observation producers: concatenated qpos/qvel
+        # and first-two-column 6D heading rotation. Never infer qpos from MLP offsets.
+        feature_dims = {'command_multi_future_nonflat': 2 * self.num_dofs,
+                        'motion_anchor_ori_heading_mf_nonflat': 6}
+        self.decoder_input_features = tuple(dec.inputs)
+        self.decoder_output_feature_dims = {name: feature_dims[name] for name in dec.outputs}
+        self.output_frame_dim = sum(self.decoder_output_feature_dims.values())
         ckpt, digest = load_checkpoint(checkpoint)
         state = {k[len(PREFIX):]:v.float() for k,v in ckpt['policy_state_dict'].items() if k.startswith(PREFIX)}
-        dims = [64,2048,1024,512,512,640]
+        dims = [self.token_total_dim, *list(layer.hidden_dims), self.frames * self.output_frame_dim]
         modules = []
         for i,(a,b) in enumerate(zip(dims[:-1],dims[1:])):
             modules.append(nn.Linear(a,b))
@@ -169,22 +188,49 @@ class SonicKinematicDecoder(nn.Module):
         if asset != 'g1_29dof_rev_1_0.xml':
             raise ValueError('Unexpected training skeleton')
         skeleton = sonic_root/'gear_sonic/data/assets/robot_description/mjcf'/asset
-        order_path = sonic_root/'gear_sonic/envs/manager_env/robots/g1.py'
-        self.fk = G1ForwardKinematics(skeleton, official_body_order(order_path))
+        self.fk = G1ForwardKinematics(skeleton, body_order)
         self.metadata = dict(checkpoint=str(checkpoint), checkpoint_sha256=digest,
             config_sha256=sha256(config_path), skeleton=str(skeleton), skeleton_sha256=sha256(skeleton),
             joint_order_sha256=sha256(order_path), reference_frame='pelvis', eef_reference='wrist_yaw_link',
-            decoder_frame_index=0, decoder_frame_offset_seconds=0., decoder_frames=frames)
+            decoder_frame_index=0, decoder_frame_offset_seconds=0., decoder_frames=frames,
+            token_dim=self.token_dim, max_num_tokens=self.max_num_tokens, token_total_dim=self.token_total_dim,
+            token_layout='[B,H,num_tokens,token_dim]; flat_index=n*token_dim+d',
+            decoder_output_features=self.decoder_output_feature_dims,
+            universal_token_source_sha256=sha256(sonic_root/'gear_sonic/trl/modules/universal_token_modules.py'))
         self.to(device=device, dtype=torch.float32).requires_grad_(False).eval()
 
+    def to_internal_tokens(self, tokens):
+        """Restore raw DiT4DiT [B,H,64] to SONIC [B,H,2,32]."""
+        tokens = torch.as_tensor(tokens, device=self.module[0].weight.device, dtype=torch.float32)
+        return restore_internal_tokens(tokens, num_tokens=self.max_num_tokens, token_dim=self.token_dim)
+
+    def _decode_temporal(self, internal):
+        # BaseModule.forward contract: flatten only (num_tokens, token_dim).
+        flat = internal.reshape(*internal.shape[:-2], self.token_total_dim)
+        output = self.module(flat)
+        return output.reshape(*output.shape[:-1], self.frames, self.output_frame_dim)
+
+    @torch.inference_mode()
+    def decode_fields(self, tokens):
+        """Return configured named output fields, preserving B and H axes.
+
+        v1.1: command_multi_future_nonflat [B,H,10,58] and
+        motion_anchor_ori_heading_mf_nonflat [B,H,10,6].
+        """
+        internal = self.to_internal_tokens(tokens)
+        with torch.autocast(device_type=internal.device.type, enabled=False):
+            return decode_feature_dict(self._decode_temporal, {'token': internal},
+                                       self.decoder_input_features, self.decoder_output_feature_dims)
+
     def decode_joints(self, tokens):
-        if tokens.shape[-1] != 64 or not torch.isfinite(tokens).all():
-            raise ValueError('Expected finite raw SONIC tokens [...,64]')
-        # Output features are interleaved per decoder frame (58 command + 6 heading).
-        output = self.module(tokens.float()).reshape(*tokens.shape[:-1], self.frames,64)
-        command = output[...,:58].reshape(*tokens.shape[:-1], self.frames*58)
-        # Producer concatenates ALL positions, then ALL velocities before reshaping.
-        return command[...,:self.frames*29].reshape(*tokens.shape[:-1],self.frames,29)
+        fields = self.decode_fields(tokens)
+        command = fields['command_multi_future_nonflat']
+        # Official producer concatenates ALL frame positions, then ALL frame
+        # velocities before reshaping into command rows. Split that named field,
+        # not the decoder's concatenated raw output.
+        command_flat = command.flatten(start_dim=-2)
+        positions, _velocities = command_flat.split(self.frames * self.num_dofs, dim=-1)
+        return positions.reshape(*command.shape[:-2], self.frames, self.num_dofs)
 
     @torch.inference_mode()
     def decode(self, tokens):

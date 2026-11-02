@@ -62,9 +62,13 @@ class Tests(unittest.TestCase):
         # Known producer layout: all qpos followed by all qvel, then split into 58D rows.
         q=torch.arange(290.).reshape(10,29); velocity=10000+q
         output=torch.cat((torch.cat((q.flatten(),velocity.flatten())).reshape(10,58),torch.zeros(10,6)),-1)
-        class Fixed(torch.nn.Module):
-            def forward(self,x):return output.flatten().expand(*x.shape[:-1],640)
-        m=SonicKinematicDecoder.__new__(SonicKinematicDecoder);torch.nn.Module.__init__(m);m.frames=10;m.module=Fixed()
+        m=SonicKinematicDecoder.__new__(SonicKinematicDecoder);torch.nn.Module.__init__(m)
+        m.frames=10; m.num_dofs=29; m.token_dim=32; m.max_num_tokens=2; m.token_total_dim=64
+        m.output_frame_dim=64; m.decoder_input_features=('token',)
+        m.decoder_output_feature_dims={'command_multi_future_nonflat':58,'motion_anchor_ori_heading_mf_nonflat':6}
+        m.module=torch.nn.Sequential(torch.nn.Linear(64,640))
+        with torch.no_grad():
+            m.module[0].weight.zero_();m.module[0].bias.copy_(output.flatten())
         torch.testing.assert_close(m.decode_joints(torch.zeros(1,2,64)),q.expand(1,2,10,29))
 
 if __name__=='__main__':unittest.main()

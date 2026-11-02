@@ -98,3 +98,35 @@ OMP_NUM_THREADS=2 PYTHONPATH=. .venv_kinematic_eval/bin/python \
 验收文件位于 `results/sonic_kinematic_validation/`：`parity.json`、`data_check/verification.json`、`distributed/verification.json`、`real_prediction/evaluation_result.json`。
 TensorBoard 目录：`results/sonic_kinematic_validation/real_prediction/tensorboard`。
 上述旧模型诊断不代表未见数据泛化成绩，也不代表 TCP 或实机任务成功。
+
+## 显式 token 适配与命名解码输出（第2步）
+
+`SonicKinematicDecoder.to_internal_tokens(raw_tokens)` 将 `[B,H,64]` 还原为 `[B,H,2,32]`。
+参数来自匹配配置：`token_dim=num_fsq_levels=32`、`max_num_tokens=2`，并验证 `token_total_dim=64` 和 BaseModule 的输入/输出时间维。
+轴对应关系为 `internal[b,h,n,d] = raw_tokens[b,h,n*32+d]`；不交换 B/H，不转成 `[B,H,32,2]`，支持非连续张量。
+输入为反归一化后的 SONIC token，不再次编码或 FSQ 量化；现有评价器先反归一化再进入该接口。
+
+```python
+internal = model.to_internal_tokens(raw_tokens)  # [B,H,2,32]
+fields = model.decode_fields(raw_tokens)
+command = fields['command_multi_future_nonflat']        # [B,H,10,58]
+heading = fields['motion_anchor_ori_heading_mf_nonflat'] # [B,H,10,6]
+positions, rotations = model.decode(raw_tokens)          # 原腕部评价接口不变
+```
+
+`sonic_token_adapter.py` 移植了官方 `UniversalTokenModule.decode()` 的按配置拼接输入、按有序字段维度拆分输出逻辑。
+运行时不导入完整 SONIC 训练模块。输出字段顺序来自 `decoders.g1_kin.outputs`；宽度来自已核实的 observation producer 契约：command=2×29 DOF，heading=6D旋转。
+MLP 只展平最后两个 token 轴；输出恢复时间维后才按字段拆分。关节角从命名 command 字段的 qpos/qvel 布局恢复，不再切片原始 MLP 输出的固定前缀。
+
+顺序证据：
+- `gear_sonic/utils/inference_helpers.py` 的 encoder ONNX 导出使用 `selected_tokens.flatten(start_dim=-2)`。
+- `UniversalTokenModule.forward()` 对内部 token 使用同一最后两轴展平规则；`assemble_all_tokens()` 组织为 `[B,S,num_tokens,token_dim]`。
+- 部署 C++ 的 `GatherTokenState()` 按相同索引复制 encoder buffer。
+- `run_data_exporter.py` 将 `proprio['token_state']` 原序写入 `action.motion_token`。
+- `convert_sonic_to_dit4dit.py` 保留该列，且本次逐行对比源/目标 parquet 全部38,333行一致。
+
+新增回归覆盖非连续输入、B/H/token/feature索引、错误宽度、非有限值、配置字段顺序及输入字段顺序。
+验收脚本直接执行官方源文件的 `assemble_all_tokens` 和 `decode` 方法，并调用官方 `BaseModule`：随机token及真实记录token逐字段一致。
+本次14项测试通过，官方命名字段最大差0，FK对照仍通过。结果：
+`results/sonic_kinematic_validation/token_adapter_parity.json`。
+本次第2步不重复执行完整 GPU 策略预测；验证的是实际 checkpoint 的解码与数据顺序，前一节的真实策略/TensorBoard验收属于第1步。
