@@ -1,0 +1,2 @@
+# Install into the existing isolated evaluation environment.
+matplotlib==3.10.7

@@ -168,3 +168,79 @@ links and synthetic TCP offsets: max component difference 2.8516e-7.
 Report: `results/sonic_kinematic_validation/reconstruction_fk_parity.json`.
 Default decode output is exactly unchanged. Full DiT prediction was not
 rerun for this step. Synthetic offsets are not hardware TCP calibration.
+
+## 步骤 4–7：完整采样、轨迹日志与可微训练损失
+
+### 采样与统计口径
+
+实际 SONIC 路径为 `rtc_deploy/model_adapter.py:Policy.predict(previous=None)` →
+`DiT4DiT.predict_action` → `FlowmatchingActionHead.predict_action`，完成配置规定的
+所有 Euler 步后返回归一化 `[B,50,66]`。评价器调用相同接口，移除了不起作用的
+DDIM 参数。反归一化复用部署的 `unnormalize_sonic_actions`，每个预测/标签仅一次，
+然后截取前 64 维。ZMQ 示例会截取 23 维并对 state 做 sin/cos，属于另一机器人
+接口，不能用于 SONIC。本评价不带 RTC 历史动作引导，不宣称验证连续 RTC 闭环。
+
+新训练仍按 episode 保存/复用 90/10 划分，只用训练 episode 的统计。
+训练和验证样本现在都携带 `valid_time_mask[H]`、`decoder_reference_mask[H,1]`、
+episode 和起始帧。前者排除动作 chunk 尾部重复，后者显式限定当前 SONIC 参考帧。
+末端要求全部 64 个分量有效，并取两个时间 mask 的交集；token MSE 使用各分量
+有效 mask。decoder 内部未来 1–9 帧不参与本版指标/损失，也不根据 action chunk
+步长猜测其有效性。
+
+新增 `val/eef_kin_{left|right}_mean_cm_ref00` 标量，明确参考帧 0；原有五组
+horizon、mean、P95、角度、token MSE 等保留。当前共有 22 个标量（全 horizon
+组均有效时）。`val/eef_kin_trajectory` 为固定有效样本的左右 xyz 预测/标签曲线，
+单位厘米、pelvis 局部系，padding 以断线处理。主进程同时保存
+`eef_trajectory_step_<step>.png`，离线入口会读回 TensorBoard 的图像标签和步数。
+绘图依赖安装命令：`.venv_kinematic_eval/bin/pip install -r tests/requirements-sonic-eval.txt`。
+
+### 训练损失（默认关闭，显式启用）
+
+在现有训练启动命令追加：
+
+```text
+trainer.eef_training_loss.enabled=true
+trainer.eef_training_loss.position_weight=1.0
+trainer.eef_training_loss.rotation_weight=0.1
+```
+
+同时保持 `trainer.kinematic_validation.enabled=true`；仅支持含 action 的训练模式。
+权重为初始配置值，未证明能提升任务成功率。关闭时仍返回原 flow loss，保持旧
+checkpoint 的参数结构；冻结 decoder 不加入模型 checkpoint 或优化器。
+
+当前 flow 参数化为 `x_t=(1-t)*action+t*noise`、`v=noise-action`，因此辅助损失
+使用 `action_clean_hat=x_t-t*v_pred`，不是直接将 velocity 当动作，也不是把完整
+验证采样循环放进训练。这个单步干净估计与完整采样结果有不同用途。
+
+`SonicKinematicDecoder.decode_differentiable()` 保留输入梯度；预测分支没有
+`no_grad`/`inference_mode`，decoder 参数仍冻结、eval、FP32。目标分支关闭梯度。
+先筛选有效帧，再将预测/标签各反归一化一次并经过同一个 decoder 与可微 FK。
+损失为左右末端欧氏距离平方的均值（m²）和 SO(3) 测地角平方的均值（rad²），
+按配置权重加入原总 loss。日志为 `train/eef_position_m2`、
+`train/eef_rotation_rad2`、`train/eef_weighted`。验证指标的厘米/度单位不变。
+裁剪沿用部署的 [-1,1]，饱和分量的梯度为零，没有使用 straight-through 近似。
+Dex1 后两维不进入该辅助损失。最佳 checkpoint 选择规则未改。
+
+### 本次验收
+
+- 23 项单元测试通过，包括实际 framework/trainer 方法的启用/关闭接线、重复
+  diffusion batch 的时间 mask、空 mask、恒等旋转梯度、冻结参数和 Dex1 排除。
+- 真实数据划分/训练统计/尾部 padding 回归通过，源统计文件未修改。
+- 两进程 CPU Gloo 汇总与串行一致，去重、RNG/模式恢复及 TensorBoard 验证通过。
+- 19000-step 模型真实完整采样：2 窗口、100 有效帧，22 个 scalar 和轨迹 image
+  的 event 标签/step=19000 检查通过。左右位置均值约 2.7200/2.6766 cm，
+  P95 约 4.8382/5.2246 cm，姿态均值约 13.0425/10.8222 度。
+- 捕获真实图像产生的 backbone 特征，用真实动作头执行一次辅助损失 backward：
+  EEF 对 action decoder 权重的梯度范数 0.15793，冻结 decoder 参数无梯度，
+  Dex1 的 EEF 梯度为零；总梯度有限。**优化器更新次数为零**。
+
+结果目录 `results/sonic_kinematic_validation/step47_real_prediction/`：
+`evaluation_result.json`、`training_gradient_verification.json`、TensorBoard events
+和轨迹 PNG。此旧模型未按本次 holdout 训练，结果仍是诊断指标，不是未见 episode
+泛化性能。没有启动长期训练，没有硬件/任务成功率验证。
+
+复现完整采样和一次梯度验证：使用前文离线命令的相同参数，将
+`-m DiT4DiT.evaluation.evaluate_sonic` 替换为
+`tests/verify_sonic_real_prediction.py`，输出目录改为
+`results/sonic_kinematic_validation/step47_real_prediction`。
+该测试捕获真实采样的条件特征，再单独验证动作头反向，不启动优化器。

@@ -69,6 +69,8 @@ def main():
     for key in metrics:
         event=events.Scalars(key)[-1]
         if event.step!=a.step: raise AssertionError('TensorBoard step mismatch')
+    image=events.Images('val/eef_kin_trajectory')[-1]
+    if image.step!=a.step: raise AssertionError('TensorBoard trajectory step mismatch')
     result={'status':'REAL_PREDICTION_AND_TENSORBOARD_OK','step':a.step,'metrics':metrics,'metadata':evaluator.metadata}
     (a.output/'evaluation_result.json').write_text(json.dumps(result,indent=2))
     print(json.dumps(result,indent=2))

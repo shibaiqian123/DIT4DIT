@@ -165,9 +165,24 @@ class DiT4DiT(baseframework):
                 )
                 state_repeated = state.repeat(repeated_diffusion_steps, 1, 1)
 
-            action_loss = self.action_model(last_hidden_repeated, actions_target_repeated, action_mask, state_repeated)  # (B, chunk_len, action_dim)
+            eef_enabled = bool(self.config.trainer.get('eef_training_loss', {}).get('enabled', False))
+            if eef_enabled:
+                times = torch.as_tensor(np.stack([ex['valid_time_mask'] for ex in examples]), device=last_hidden.device)
+                times = times[:, -actions_target.shape[1]:].repeat(repeated_diffusion_steps, 1)
+                references = torch.as_tensor(np.stack([ex['decoder_reference_mask'] for ex in examples]), device=last_hidden.device)
+                if references.shape[-1] != 1:
+                    raise ValueError('EEF training only supports current SONIC reference frame')
+                references = references[:, -actions_target.shape[1]:, 0].repeat(repeated_diffusion_steps, 1)
+                eef_mask = action_mask.bool() & (times & references)[...,None]
+                action_loss, clean_actions = self.action_model(last_hidden_repeated, actions_target_repeated,
+                    action_mask, state_repeated, return_clean_estimate=True)
+            else:
+                action_loss = self.action_model(last_hidden_repeated, actions_target_repeated, action_mask, state_repeated)
 
         out = {"action_loss": action_loss}
+        if eef_enabled:
+            out.update(eef_clean_actions=clean_actions, eef_target_actions=actions_target_repeated,
+                       eef_valid_elements=eef_mask)
         if future_video_loss is not None:
             out["future_video_loss"] = future_video_loss
         return out

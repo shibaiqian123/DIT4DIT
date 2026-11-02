@@ -1821,12 +1821,14 @@ class LeRobotMixtureDataset(Dataset):
                     action_mask=action_mask,
                     state_mask=state_mask,
                 )
-                if hasattr(self, "_kinematic_windows"):
+                if getattr(self, "_sonic_validity_metadata", False):
                     length = int(dataset.trajectory_lengths[list(dataset.trajectory_ids).index(trajectory_id)])
                     offsets = dataset.delta_indices[dataset.modality_keys["action"][0]]
                     if len(offsets) != n_action_tokens:
                         raise ValueError("Action horizon and delta indices differ")
                     out["valid_time_mask"] = (step + offsets >= 0) & (step + offsets < length)
+                    # Only decoder current frame is supervised, not its 9 future references.
+                    out["decoder_reference_mask"] = out["valid_time_mask"][:,None].copy()
                     out["episode_id"] = int(trajectory_id)
                     out["start_frame"] = int(step)
                     out["sample_id"] = f"{dataset.dataset_name}:{trajectory_id}:{step}"

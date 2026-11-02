@@ -24,8 +24,9 @@ class SonicEvaluator:
         self.metadata=dict(self.decoder.metadata, statistics_sha256=sha256(self.statistics_path),
             statistics_provenance=dataset.statistics_provenance,split=dataset.validation_manifest,
             metric_kind='decoded_label_kinematic_proxy',seed=int(config.seed),max_windows=len(dataset),
-            prediction_settings={'sampler':'framework.predict_action; action head configured inference steps'}, token_mse_space='normalized_unclipped',
-            kinematics_normalization='min_max_clipped')
+            prediction_settings={'sampler':'framework.predict_action; full Euler integration', 'rtc_history':False, 'postprocessing':'shared SONIC min_max inverse exactly once'}, token_mse_space='normalized_unclipped',
+            kinematics_normalization='min_max_clipped',decoder_reference_indices=[0],
+            decoder_reference_mask='current frame inherits valid action time; future references excluded')
 
     def run(self, model, step=0, writer=None):
         rank=dist.get_rank() if dist.is_initialized() else 0
@@ -46,7 +47,7 @@ class SonicEvaluator:
                     seed=int(self.config.seed)+index
                     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
                     ex=self.dataset[index]
-                    output=model.predict_action(examples=[ex],use_ddim=True,num_ddim_steps=20)
+                    output=model.predict_action(examples=[ex])
                     metrics.update(output['normalized_actions'],[ex])
         except Exception as exc:
             error=traceback.format_exc()
@@ -70,6 +71,17 @@ class SonicEvaluator:
         if rank==0:
             self.output_dir.mkdir(parents=True,exist_ok=True)
             (self.output_dir/'kinematic_evaluation_metadata.json').write_text(json.dumps(self.metadata,indent=2))
+            from .sonic_trajectory import trajectory_figure
+            import matplotlib.pyplot as plt
+            # Fixed sample identity makes comparisons across training steps meaningful.
+            key=next(k for k in sorted(metrics.rows) if metrics.rows[k]['valid'].any())
+            figure=trajectory_figure(metrics.rows[key],key)
+            try:
+                figure.savefig(self.output_dir/f'eef_trajectory_step_{step}.png',dpi=140)
+                if writer is not None:
+                    writer.add_figure('val/eef_kin_trajectory',figure,step,close=False)
+            finally:
+                plt.close(figure)
             if writer is not None:
                 writer.add_text('val/kinematic_reference',json.dumps(self.metadata),step)
                 writer.flush()

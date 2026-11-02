@@ -98,6 +98,7 @@ def build_datasets(cfg, output_dir, *, old_statistics=None, full=False):
                 if len(saved[modality]['min'])!=offset: raise ValueError('Saved statistic trailing dimensions')
             mixture.update_metadata({'percentile_mixing_method':'min_max'})
     # Copy before restricting train all_steps; transforms and metadata are independent.
+    mixture._sonic_validity_metadata=True
     validation_ds=copy.deepcopy(mixture)
     vd=validation_ds.datasets[0]
     ds._all_steps=np.asarray([(e,s) for e,s in ds.all_steps if int(e) in train_ids])

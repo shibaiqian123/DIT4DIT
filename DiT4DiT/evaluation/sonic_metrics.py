@@ -32,8 +32,13 @@ class KinematicMetrics:
         for i,ex in enumerate(examples):
             valid_elements = masks[i,:,:64] & times[i,:,None]
             valid_frames = masks[i,:,:64].all(-1) & times[i]
+            reference_mask=np.asarray(ex.get('decoder_reference_mask', times[i,:,None]),dtype=bool)
+            if reference_mask.shape != (len(times[i]),1):
+                raise ValueError('Current-frame evaluation requires decoder_reference_mask [H,1]')
+            valid_frames &= reference_mask[:,0]
             key = ex['sample_id']
             row = dict(pos=pos[i].cpu().numpy(), rot=rot[i].cpu().numpy(), valid=valid_frames,
+                prediction_position=pp[i].cpu().numpy(),target_position=tp[i].cpu().numpy(),
                 squared=(prediction[i,:,:64]-labels[i,:,:64])**2,
                 elements=valid_elements, outside=np.abs(prediction[i,:,:64])>1)
             if key in self.rows:
@@ -56,6 +61,7 @@ class KinematicMetrics:
         for i,side in enumerate(('left','right')):
             base='val/eef_kin_'+side
             result[base+'_mean_cm']=float(pos[...,i][valid].mean())
+            result[base+'_mean_cm_ref00']=result[base+'_mean_cm']
             result[base+'_p95_cm']=float(np.quantile(pos[...,i][valid],.95))
             result[base+'_rot_deg']=float(rot[...,i][valid].mean())
             for start in range(0,pos.shape[1],10):

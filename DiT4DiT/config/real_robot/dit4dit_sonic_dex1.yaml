@@ -74,6 +74,10 @@ datasets:
     action_video_freq_ratio: 2
 
 trainer:
+  eef_training_loss:
+    enabled: false  # Opt in; weights have not been tuned on task success.
+    position_weight: 1.0  # squared meters
+    rotation_weight: 0.1  # squared radians
   kinematic_validation:
     enabled: true
     checkpoint: /home/cqu023/.cache/huggingface/hub/models--nvidia--GEAR-SONIC/snapshots/6733128a3d8a523b1418b06bca3cdf61c8b0987f/sonic_v1_1/last.pt

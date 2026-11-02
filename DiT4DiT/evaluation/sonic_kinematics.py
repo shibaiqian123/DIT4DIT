@@ -220,8 +220,7 @@ class SonicKinematicDecoder(nn.Module):
         output = self.module(flat)
         return output.reshape(*output.shape[:-1], self.frames, self.output_frame_dim)
 
-    @torch.inference_mode()
-    def decode_fields(self, tokens):
+    def _decode_fields_with_grad(self, tokens):
         """Return configured named output fields, preserving B and H axes.
 
         v1.1: command_multi_future_nonflat [B,H,10,58] and
@@ -231,6 +230,19 @@ class SonicKinematicDecoder(nn.Module):
         with torch.autocast(device_type=internal.device.type, enabled=False):
             return decode_feature_dict(self._decode_temporal, {'token': internal},
                                        self.decoder_input_features, self.decoder_output_feature_dims)
+
+    @torch.inference_mode()
+    def decode_fields(self, tokens):
+        return self._decode_fields_with_grad(tokens)
+
+    def decode_differentiable(self, tokens):
+        """Frozen FP32 parameters, but retain input gradients for training."""
+        internal = self.to_internal_tokens(tokens)
+        with torch.autocast(device_type=internal.device.type, enabled=False):
+            fields = decode_feature_dict(self._decode_temporal, {'token': internal},
+                                         self.decoder_input_features, self.decoder_output_feature_dims)
+            joints = parse_reconstruction(fields, self.frames, self.num_dofs).joint_positions
+            return self.end_effectors(*self.fk(joints[...,0,:]))
 
     @torch.inference_mode()
     def decode_reconstruction(self, tokens):

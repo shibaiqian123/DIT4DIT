@@ -58,6 +58,16 @@ class Tests(unittest.TestCase):
         with self.assertRaises(ValueError):m.compute()
         with self.assertRaises(ValueError):m.update(np.full((1,50,66),np.nan),[ex])
 
+    def test_reference_mask_is_separate_from_token_mask(self):
+        ex=example();ex['decoder_reference_mask']=np.ones((50,1),bool)
+        ex['decoder_reference_mask'][10:20]=False
+        m=KinematicMetrics(FakeDecoder(),statistics());m.update(np.zeros((1,50,66)),[ex])
+        values=m.compute()
+        self.assertEqual(values['val/eef_kin_valid_frames'],40)
+        self.assertNotIn('val/eef_kin_left_mean_cm_h10_19',values)
+        self.assertEqual(values['val/token_mse'],0)
+        self.assertEqual(values['val/eef_kin_left_mean_cm_ref00'],0)
+
     def test_layout(self):
         # Known producer layout: all qpos followed by all qvel, then split into 58D rows.
         q=torch.arange(290.).reshape(10,29); velocity=10000+q

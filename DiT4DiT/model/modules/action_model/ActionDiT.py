@@ -265,7 +265,7 @@ class FlowmatchingActionHead(nn.Module):
         return BatchFeature(data=batch)
 
 
-    def forward(self, vl_embs: torch.Tensor, actions: torch.Tensor, action_mask: torch.Tensor, state: torch.Tensor = None, encoder_attention_mask=None):
+    def forward(self, vl_embs: torch.Tensor, actions: torch.Tensor, action_mask: torch.Tensor, state: torch.Tensor = None, encoder_attention_mask=None, return_clean_estimate=False):
         """
         vl_embs: shape (B, seq_length, feature_dim)
         actions: shape (B, future_action_window_size, D_action)
@@ -315,6 +315,9 @@ class FlowmatchingActionHead(nn.Module):
         # Slice out only the action portion of pred and target.
         loss = ((pred_actions - velocity) ** 2) * action_mask
         loss = loss.sum() / action_mask.sum()
+        if return_clean_estimate:
+            from DiT4DiT.evaluation.sonic_training_loss import clean_flow_estimate
+            return loss, clean_flow_estimate(noisy_trajectory, t, pred_actions)
         return loss
 
     @torch.no_grad()

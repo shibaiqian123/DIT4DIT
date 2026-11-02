@@ -140,6 +140,11 @@ class VLATrainer(TrainerUtils):
         self.model = model
         self.kinematic_validation_dataset = getattr(vla_train_dataloader, "kinematic_validation_dataset", None)
         self.kinematic_evaluator = None
+        if cfg.trainer.get('eef_training_loss', {}).get('enabled', False):
+            if self.kinematic_validation_dataset is None:
+                raise ValueError('Enable SONIC kinematic validation/data split before EEF training')
+            if cfg.framework.cosmos25.training.lower() == 'video':
+                raise ValueError('EEF training requires the action branch')
         self.vla_train_dataloader = vla_train_dataloader
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
@@ -537,6 +542,27 @@ class VLATrainer(TrainerUtils):
                         # video only
                         total_loss = future_video_loss_scaled
 
+                    eef_parts = None
+                    if self.config.trainer.get('eef_training_loss', {}).get('enabled', False):
+                        if self.kinematic_validation_dataset is None:
+                            raise ValueError('EEF training requires SONIC episode split and training statistics')
+                        if not hasattr(self, '_eef_training_criterion'):
+                            from DiT4DiT.evaluation.sonic_training_loss import SonicEndEffectorLoss
+                            from DiT4DiT.evaluation.sonic_kinematics import SonicKinematicDecoder
+                            import json
+                            from pathlib import Path
+                            settings = self.config.trainer.kinematic_validation
+                            weights = self.config.trainer.eef_training_loss
+                            stats = json.loads((Path(self.config.output_dir)/'dataset_statistics.json').read_text())['new_embodiment']['action']
+                            decoder = SonicKinematicDecoder(settings.checkpoint, settings.sonic_root,
+                                device=output_dict['eef_clean_actions'].device,
+                                eef_links=settings.get('eef_links'), link_to_tcp=settings.get('link_to_tcp'))
+                            self._eef_training_criterion = SonicEndEffectorLoss(decoder, stats,
+                                weights.position_weight, weights.rotation_weight).to(output_dict['eef_clean_actions'].device)
+                        eef_parts = self._eef_training_criterion(output_dict['eef_clean_actions'],
+                            output_dict['eef_target_actions'], output_dict['eef_valid_elements'])
+                        total_loss = total_loss + eef_parts['weighted']
+
                     # VLA backward propagation (keep inside enable_grad scope)
                     self.accelerator.backward(total_loss)
 
@@ -552,6 +578,8 @@ class VLATrainer(TrainerUtils):
                 self.optimizer.zero_grad(set_to_none=True)
 
         step_metrics = {}
+        if eef_parts is not None:
+            step_metrics.update({'train/eef_'+k: v.detach().item() for k,v in eef_parts.items()})
         if action_loss is not None:
             step_metrics["action_dit_loss"] = action_loss.item()
         if future_video_loss is not None:
