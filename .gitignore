@@ -25,3 +25,5 @@ __pycache__/
 /.venv_kinematic_eval/
 
 /sonic_ckpt
+
+/output
