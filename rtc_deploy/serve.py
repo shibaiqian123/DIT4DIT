@@ -1,5 +1,6 @@
 """Loopback inference only. One owner, one GPU request, no robot publishers."""
 import argparse
+from latency_trace import mark, stamp
 import asyncio
 import json
 import uuid
@@ -48,6 +49,7 @@ def create_app(policy, action_exec_horizon=25):
             nonlocal latest_obs, busy, session
             while True:
                 r = await socket.receive_json()
+                mark(r.get('request_id', 'unbound'), 'server_received')
                 if r.get('op') == 'observe':
                     latest_obs = r['observation']  # single slot; never queues stale images
                     continue
@@ -65,6 +67,8 @@ def create_app(policy, action_exec_horizon=25):
                 if obs is None:
                     raise ValueError('Observation missing')
                 # Freeze observation and progress together; never substitute a later pose.
+                obs = dict(obs)
+                obs['_latency_request'] = r['request_id']
                 r['observation'] = obs
                 seen.add(r['request_id'])
                 busy = True
@@ -100,6 +104,7 @@ def create_app(policy, action_exec_horizon=25):
                     previous = np.asarray(result['normalized'], dtype=np.float32)
                     chunk_id = uuid.uuid4().hex
                     last_consumed = 0
+                    mark(r['request_id'], 'reply_send_start')
                     await send(dict(result, ok=True, session=session, request_id=r['request_id'],
                                     chunk_id=chunk_id, observation_id=obs['observation_id'],
                                     observed_at=obs['observed_at'], window_offset=s, estimated_delay=d,

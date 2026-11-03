@@ -6,6 +6,7 @@ import json
 import time
 from pathlib import Path
 import numpy as np
+from latency_trace import mark, stamp
 from PIL import Image
 import torch
 from rtc_sampler import RTCActionHead
@@ -70,9 +71,12 @@ class Policy:
         return dict(image=[image], lang=obs['lang'], state=norm)
 
     def predict(self, obs, previous=None, delay=0, consumed=0, alpha=0.9):
+        trace_id = obs.get('_latency_request', obs['observation_id'])
+        mark(trace_id, 'predict_start')
         ex = self.example(obs)
         torch.cuda.synchronize()
         start = time.monotonic()
+        mark(trace_id, 'preprocess_done')
         if previous is None:
             with torch.no_grad():
                 norm = self.model.predict_action([ex])['normalized_actions'][0]
@@ -92,6 +96,7 @@ class Policy:
         if not np.isfinite(actions).all():
             raise ValueError('Nonfinite denormalized actions')
         torch.cuda.synchronize()
+        mark(trace_id, 'predict_done')
         return dict(normalized=norm.tolist(), motion_tokens=actions[:,:64].tolist(),
                     gripper_actions=actions[:,64:].tolist(), inference_seconds=time.monotonic()-start,
                     out_of_range_fraction=float((np.abs(norm)>1).mean()))
