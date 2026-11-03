@@ -48,8 +48,11 @@ def create_app(policy, action_exec_horizon=25):
         async def reader():
             nonlocal latest_obs, busy, session
             while True:
-                r = await socket.receive_json()
-                mark(r.get('request_id', 'unbound'), 'server_received')
+                wire = await socket.receive_text()
+                receive_stamp = stamp()
+                r = json.loads(wire)
+                mark(r.get('request_id', 'unbound'), 'server_received', at=receive_stamp)
+                mark(r.get('request_id', 'unbound'), 'server_decoded')
                 if r.get('op') == 'observe':
                     latest_obs = r['observation']  # single slot; never queues stale images
                     continue

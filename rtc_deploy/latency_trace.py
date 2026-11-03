@@ -58,7 +58,11 @@ def mark(trace_id, stage, at=None, **meta):
 EDGES = [
     ('camera_request_roundtrip_229', 'camera_request_229', 'camera_payload_229'),
     ('camera_jpeg_decode_229', 'camera_payload_229', 'camera_jpeg_decoded_229'),
-    ('camera_capture_to_send', 'g1_capture', 'g1_camera_send'),
+    ('g1_camera_wait', 'g1_camera_requested', 'g1_camera_selected'),
+    ('g1_camera_frame_age', 'g1_mjpeg_ready', 'g1_camera_selected'),
+    ('g1_camera_send_api', 'g1_camera_send', 'g1_camera_send_done'),
+    ('camera_g1_to_229_response', 'g1_camera_send', 'camera_payload_229'),
+    ('rtc_to_sonic_token_decode_229', 'action_send', 'sonic_token_decoded'),
     ('camera_g1_to_229', 'g1_camera_send', 'camera_229_receive'),
     ('camera_decode_229', 'camera_229_receive', 'camera_229_decoded'),
     ('observation_build_229', 'obs_build_start', 'obs_ready'),
@@ -66,8 +70,13 @@ EDGES = [
     ('request_queue_229', 'request_queued', 'request_encode_start'),
     ('request_json_229', 'request_encode_start', 'request_send_start'),
     ('request_send_api_229', 'request_send_start', 'request_send_done'),
-    ('uplink_229_to_32_including_decode', 'request_send_start', 'server_received'),
-    ('server_wait_32', 'server_received', 'predict_start'),
+    ('uplink_229_to_32', 'request_send_start', 'server_received'),
+    ('request_json_32', 'server_received', 'server_decoded'),
+    ('server_wait_32', 'server_decoded', 'predict_start'),
+    ('sonic_decoder_229', 'sonic_decode_start', 'sonic_decode_done'),
+    ('sonic_command_prepare_229', 'sonic_decode_done', 'sonic_command_ready'),
+    ('sonic_command_queue_229', 'dds_command_ready', 'dds_write_start'),
+    ('dds_write_api_229', 'dds_write_start', 'dds_write_done'),
     ('preprocess_32', 'predict_start', 'preprocess_done'),
     ('model_and_postprocess_32', 'preprocess_done', 'predict_done'),
     ('predict_total_32', 'predict_start', 'predict_done'),
@@ -84,6 +93,55 @@ EDGES = [
 ]
 
 
+def clock_intervals(events):
+    samples = collections.defaultdict(list)
+    for e in events:
+        if e.get('stage') == 'clock_sync':
+            c = e['clock']
+            samples[(c['host'], c['boot'])].append(e)
+    result = collections.defaultdict(list)
+    for (host, boot), records in samples.items():
+        records.sort(key=lambda e: e['clock']['mono_ns'])
+        for left, right in zip(records, records[1:]):
+            lm, rm = left['meta'], right['meta']
+            if lm.get('status') != 'ok' or rm.get('status') != 'ok':
+                continue
+            le, re = lm['estimate'], rm['estimate']
+            if le.get('reference') != re.get('reference'):
+                continue
+            lc, rc = left['clock'], right['clock']
+            seconds = (rc['mono_ns'] - lc['mono_ns']) / 1e9
+            if not 0 < seconds <= 10:
+                continue
+            discontinuity_ms = abs((rc['wall_ns']-lc['wall_ns']) - (rc['mono_ns']-lc['mono_ns']))/1e6
+            if discontinuity_ms > 1:
+                continue
+            uncertainty = max(le['uncertainty_ms'], re['uncertainty_ms'])
+            query_ms = max((e['clock']['mono_ns']-e['meta']['query_start']['mono_ns'])/1e6
+                           for e in (left, right))
+            uncertainty += query_ms + discontinuity_ms + seconds*max(le['skew_ppm'],re['skew_ppm'])/1000
+            if not math.isfinite(uncertainty) or uncertainty < 0:
+                continue
+            result[host].append(dict(boot=boot, offset_ms=0, uncertainty_ms=uncertainty,
+                                     valid_from_ns=lc['wall_ns'],valid_until_ns=rc['wall_ns'],
+                                     source='chrony_bracketed', reference_scale='UTC'))
+    return result
+
+
+def select_calibration(clock, sync):
+    entries = sync[clock['host']]
+    if isinstance(entries, dict):
+        entries = [entries]  # Legacy explicit calibration file.
+    for entry in entries:
+        if entry.get('boot', clock['boot']) != clock['boot']:
+            continue
+        if entry['valid_from_ns'] <= clock['wall_ns'] <= entry['valid_until_ns']:
+            return entry
+    if isinstance(sync[clock['host']], dict):
+        return sync[clock['host']]
+    raise KeyError('No clock evidence covering event')
+
+
 def duration(a, b, sync):
     ca, cb = a['clock'], b['clock']
     if ca['host'] == cb['host'] and ca['boot'] == cb['boot']:
@@ -91,7 +149,7 @@ def duration(a, b, sync):
         return (ms, 0.0, 'monotonic') if ms >= 0 else (None, None, 'invalid_order')
     # The user supplies measured bounds, NOT a switch asserting clocks are equal.
     try:
-        sa, sb = sync[ca['host']], sync[cb['host']]
+        sa, sb = select_calibration(ca, sync), select_calibration(cb, sync)
         for c, s in ((ca, sa), (cb, sb)):
             if not s['valid_from_ns'] <= c['wall_ns'] <= s['valid_until_ns']:
                 return None, None, 'sync_evidence_expired'
@@ -108,6 +166,9 @@ def duration(a, b, sync):
 
 
 def analyze(events, sync=None):
+    events = list(events)
+    if sync is None:
+        sync = clock_intervals(events)
     groups = collections.defaultdict(dict)
     duplicate_keys = set()
     seen = set()
@@ -248,7 +309,7 @@ def main():
             for line in f:
                 if line.strip():
                     events.append(json.loads(line))
-    rows = analyze(events, json.loads(Path(args.sync).read_text()) if args.sync else {})
+    rows = analyze(events, json.loads(Path(args.sync).read_text()) if args.sync else None)
     summary = {}
     for name in sorted({r['segment'] for r in rows}):
         rr = [r for r in rows if r['segment']==name]
@@ -257,7 +318,8 @@ def main():
                              statuses=dict(collections.Counter(r['status'] for r in rr)))
         if values:
             summary[name].update(mean_ms=sum(values)/len(values),
-                                 p95_ms=values[max(0, math.ceil(.95*len(values))-1)], max_ms=max(values))
+                                 p95_ms=values[max(0, math.ceil(.95*len(values))-1)], max_ms=max(values),
+                                 max_uncertainty_ms=max(r['uncertainty_ms'] or 0 for r in rr if r['ms'] is not None))
         print(name, json.dumps(summary[name]))
     Path(args.output).write_text(json.dumps(dict(summary=summary, samples=rows), indent=2))
 
