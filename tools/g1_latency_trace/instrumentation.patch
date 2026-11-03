@@ -1,0 +1,205 @@
+--- a/serve.py
++++ b/serve.py
+@@ -1,5 +1,6 @@
+ """Loopback inference only. One owner, one GPU request, no robot publishers."""
+ import argparse
++from latency_trace import mark, stamp
+ import asyncio
+ import json
+ import uuid
+@@ -48,6 +49,7 @@
+             nonlocal latest_obs, busy, session
+             while True:
+                 r = await socket.receive_json()
++                mark(r.get('request_id', 'unbound'), 'server_received')
+                 if r.get('op') == 'observe':
+                     latest_obs = r['observation']  # single slot; never queues stale images
+                     continue
+@@ -65,6 +67,8 @@
+                 if obs is None:
+                     raise ValueError('Observation missing')
+                 # Freeze observation and progress together; never substitute a later pose.
++                obs = dict(obs)
++                obs['_latency_request'] = r['request_id']
+                 r['observation'] = obs
+                 seen.add(r['request_id'])
+                 busy = True
+@@ -100,6 +104,7 @@
+                     previous = np.asarray(result['normalized'], dtype=np.float32)
+                     chunk_id = uuid.uuid4().hex
+                     last_consumed = 0
++                    mark(r['request_id'], 'reply_send_start')
+                     await send(dict(result, ok=True, session=session, request_id=r['request_id'],
+                                     chunk_id=chunk_id, observation_id=obs['observation_id'],
+                                     observed_at=obs['observed_at'], window_offset=s, estimated_delay=d,
+--- a/model_adapter.py
++++ b/model_adapter.py
+@@ -6,6 +6,7 @@
+ import time
+ from pathlib import Path
+ import numpy as np
++from latency_trace import mark, stamp
+ from PIL import Image
+ import torch
+ from rtc_sampler import RTCActionHead
+@@ -117,9 +118,12 @@
+         return dict(image=[image], lang=obs['lang'], state=norm)
+ 
+     def predict(self, obs, previous=None, delay=0, consumed=0, alpha=0.9):
++        trace_id = obs.get('_latency_request', obs['observation_id'])
++        mark(trace_id, 'predict_start')
+         ex = self.example(obs)
+         torch.cuda.synchronize()
+         start = time.monotonic()
++        mark(trace_id, 'preprocess_done')
+         if previous is None:
+             with torch.no_grad():
+                 norm = self.model.predict_action([ex])['normalized_actions'][0]
+@@ -140,6 +144,7 @@
+             raise ValueError('Nonfinite denormalized actions')
+         grips = gripper_motor_targets(actions, self.stats['action'])
+         torch.cuda.synchronize()
++        mark(trace_id, 'predict_done')
+         return dict(normalized=norm.tolist(), motion_tokens=actions[:,:64].tolist(),
+                     gripper_actions=grips.tolist(), inference_seconds=time.monotonic()-start,
+                     out_of_range_fraction=float((np.abs(norm)>1).mean()))
+--- a/model_adapter_32.py
++++ b/model_adapter_32.py
+@@ -6,6 +6,7 @@
+ import time
+ from pathlib import Path
+ import numpy as np
++from latency_trace import mark, stamp
+ from PIL import Image
+ import torch
+ from rtc_sampler import RTCActionHead
+@@ -70,9 +71,12 @@
+         return dict(image=[image], lang=obs['lang'], state=norm)
+ 
+     def predict(self, obs, previous=None, delay=0, consumed=0, alpha=0.9):
++        trace_id = obs.get('_latency_request', obs['observation_id'])
++        mark(trace_id, 'predict_start')
+         ex = self.example(obs)
+         torch.cuda.synchronize()
+         start = time.monotonic()
++        mark(trace_id, 'preprocess_done')
+         if previous is None:
+             with torch.no_grad():
+                 norm = self.model.predict_action([ex])['normalized_actions'][0]
+@@ -92,6 +96,7 @@
+         if not np.isfinite(actions).all():
+             raise ValueError('Nonfinite denormalized actions')
+         torch.cuda.synchronize()
++        mark(trace_id, 'predict_done')
+         return dict(normalized=norm.tolist(), motion_tokens=actions[:,:64].tolist(),
+                     gripper_actions=actions[:,64:].tolist(), inference_seconds=time.monotonic()-start,
+                     out_of_range_fraction=float((np.abs(norm)>1).mean()))
+--- a/run_dit4dit_rtc_sonic_dex1.py
++++ b/run_dit4dit_rtc_sonic_dex1.py
+@@ -6,6 +6,7 @@
+ Automatic network-loss stopping at the SONIC receiver is NOT closed-loop.
+ """
+ import argparse
++from latency_trace import mark, stamp
+ import asyncio
+ import base64
+ import fcntl
+@@ -199,6 +200,7 @@
+             self.sensor_stage = 'body_init'
+             body = d['ReadOnlyBodySubscriber'](a.body_port)
+             while not self.stop.is_set():
++                obs_build_start = stamp()
+                 self.sensor_stage = 'camera_read'
+                 cm = camera.read()
+                 self.sensor_stage = 'body_read'
+@@ -225,6 +227,8 @@
+                                state=state.tolist(), lang=a.instruction, observation_id=uuid.uuid4().hex,
+                                observed_at=image_time, saved_observation=False,
+                                body_source_tick=bm['source_tick'], source_times=source_times)
++                    obs['_latency_build_start'] = obs_build_start
++                    obs['_latency_ready'] = stamp()
+                     with self.s.lock:
+                         self.s.observation, self.s.sources = obs, source_times
+                         self.s.sensor_error = ''
+@@ -371,12 +375,20 @@
+                 while True:
+                     packet = await outgoing.get()
+                     emit("send_started", request_id=packet.get("request_id"))
+-                    await ws.send(await asyncio.to_thread(json.dumps, packet))
++                    tid = packet.get('request_id')
++                    mark(tid, 'request_encode_start')
++                    wire = await asyncio.to_thread(json.dumps, packet)
++                    mark(tid, 'request_send_start')
++                    await ws.send(wire)
++                    mark(tid, 'request_send_done')
+                     emit("send_finished", request_id=packet.get("request_id"))
+             async def receiver():
+                 wire = await ws.recv()
++                receive_stamp = stamp()
+                 received_at = time.monotonic()
+                 result = await asyncio.to_thread(json.loads, wire)
++                mark(result.get('request_id'), 'reply_received', at=receive_stamp)
++                mark(result.get('request_id'), 'reply_decoded')
+                 emit("reply_received", received_at=received_at,
+                      request_id=result.get("request_id"), ok=result.get("ok"),
+                      inference_seconds=result.get("inference_seconds"))
+@@ -393,6 +405,11 @@
+                 nonlocal requested, request_time
+                 requested = s.observation_now(now)
+                 req = clock.request(uuid.uuid4().hex); request_time = now
++                tid = req['request_id']
++                for field, stage in [('_latency_build_start', 'obs_build_start'), ('_latency_ready', 'obs_ready')]:
++                    if field in requested:
++                        mark(tid, stage, at=requested[field], observation_id=requested['observation_id'])
++                mark(tid, 'request_queued', observation_id=requested['observation_id'])
+                 emit('request', **req, observation_id=requested['observation_id'],
+                      observed_at=requested['observed_at'], source_times=requested['source_times'])
+                 recorder.add('request_' + req['request_id'] + '.json', dict(req, observation=requested))
+@@ -468,6 +485,8 @@
+                             raise ValueError('Prediction too old for execution/consumption')
+                         if not clock.accept(result): raise ValueError('Old-session result')
+                         response = result; blocks += 1
++                        response['_latency_accepted'] = stamp()
++                        mark(result['request_id'], 'reply_accepted', at=response['_latency_accepted'])
+                         recorder.add(f'chunk_{blocks:04d}.json', result)
+                         interval = None if last_receive is None else now-last_receive
+                         print(f'Received action: chunk={clock.chunk_id} age={age:.3f}s external_stream={stream}; recv_action interval={interval}', flush=True)
+@@ -487,6 +506,9 @@
+                         packet = control_packet(s, 'model', now, grips[index])
+                         packet = d['target_to_trigger'](packet, limits, now)
+                         if a.execute:
++                            action_trace = f'{clock.session}:frame:{frame}'
++                            mark(action_trace, 'action_ready', at=response['_latency_accepted'], request_id=response['request_id'])
++                            mark(action_trace, 'action_send', wire_frame_index=frame, request_id=response['request_id'])
+                             pub.send(d['pack_pose_message']({'token_state': tokens[index].reshape(1,64),
+                                 'frame_index': np.array([frame], dtype=np.int64)}, topic='pose', version=4), flags=zmq.NOBLOCK)
+                             if stream == 1: s.target = packet
+--- a/run_pico_usb_stereo.py
++++ b/run_pico_usb_stereo.py
+@@ -1,5 +1,7 @@
+ """Robot USB side-by-side camera to PICO; does not use motion interfaces."""
+ import argparse
++import uuid
++from latency_trace import mark, stamp
+ import datetime
+ import os
+ from pathlib import Path
+@@ -42,14 +44,18 @@
+                     sock.settimeout(.7)
+                     sock.setsockopt(socket.IPPROTO_TCP,socket.TCP_NODELAY,1)
+                     while not self.stop_event.is_set():
++                        camera_trace = uuid.uuid4().hex
++                        mark(camera_trace, 'camera_request_229')
+                         start=time.monotonic()
+                         sock.sendall(b'N')
+                         size=struct.unpack('>I',read_exact(sock,4))[0]
+                         if not 4 <= size <= 8*1024*1024: raise ValueError('Invalid JPEG size')
+                         data=read_exact(sock,size)
++                        mark(camera_trace, 'camera_payload_229', bytes=size)
+                         frame=cv2.imdecode(np.frombuffer(data,np.uint8),cv2.IMREAD_COLOR)
+                         if frame is None or frame.shape[:2] != (720,2560):
+                             raise ValueError('Expected 2560x720 side-by-side source')
++                        mark(camera_trace, 'camera_jpeg_decoded_229')
+                         self.last_rpc_ms=(time.monotonic()-start)*1000
+                         self.latest.put(frame); self.frames+=1; self.last_error=''
+                         self.stop_event.wait(max(0,1/self.fps-(time.monotonic()-start)))
