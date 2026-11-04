@@ -6,7 +6,7 @@ import json
 import uuid
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 import uvicorn
-from protocol import shifted
+from protocol import shifted, block
 
 
 def create_app(policy, action_exec_horizon=25):
@@ -23,7 +23,8 @@ def create_app(policy, action_exec_horizon=25):
     @app.get('/info')
     async def info():
         return dict(policy.info, action_exec_horizon_default=action_exec_horizon, control_hz=50,
-                    timing='229_client_consumption_not_motor_ack', rtc_supported=True)
+                    timing='229_client_consumption_not_motor_ack', rtc_supported=True,
+                    image_encodings=['png', 'rgb8_base64'], reply_formats=['full', 'actions_only_v1'])
 
     @app.websocket('/ws')
     async def ws(socket: WebSocket):
@@ -104,7 +105,14 @@ def create_app(policy, action_exec_horizon=25):
                             await task
                             raise
                     import numpy as np
-                    previous = np.asarray(result['normalized'], dtype=np.float32)
+                    previous = block(result['normalized']).copy()
+                    reply_format = r.get('reply_format', 'full')
+                    if reply_format not in ('full', 'actions_only_v1'):
+                        raise ValueError('Unsupported reply format')
+                    if reply_format == 'actions_only_v1':
+                        # RTC history stays server-side, with its finite/shape guard.
+                        result = {k:v for k,v in result.items() if k != 'normalized'}
+                        result.update(reply_format=reply_format, normalized_validated=True)
                     chunk_id = uuid.uuid4().hex
                     last_consumed = 0
                     mark(r['request_id'], 'reply_send_start')

@@ -17,13 +17,15 @@ def soft_mask(h, d, s, *, device=None):
     return mask
 
 
-def guided_velocity(velocity_fn, x, t, previous, mask, alpha):
+def guided_velocity(velocity_fn, x, t, previous, mask, alpha, *, mask_nonzero=None):
     """VJP of x0 wrt x; do not differentiate the error or accumulate parameter grads."""
     if torch.is_inference_mode_enabled():
         raise RuntimeError('RTC cannot run inside torch.inference_mode()')
     if not math.isfinite(alpha) or alpha < 0 or not 0 < t <= 1:
         raise ValueError('Invalid guidance alpha or noise time')
-    if alpha == 0 or not bool(mask.any()) or t == 1:
+    if mask_nonzero is None:
+        mask_nonzero = bool(mask.any())
+    if alpha == 0 or not mask_nonzero or t == 1:
         with torch.no_grad():
             return velocity_fn(x, t).detach()
     with torch.enable_grad():
@@ -34,12 +36,12 @@ def guided_velocity(velocity_fn, x, t, previous, mask, alpha):
         correction = torch.autograd.grad(x0, sample, grad_outputs=error.to(x0.dtype),
                                          retain_graph=False, create_graph=False)[0].float()
     norm = correction.norm()
-    if not torch.isfinite(norm) or not torch.isfinite(error).all():
+    if not bool(torch.isfinite(norm) & torch.isfinite(error).all()):
         raise ValueError('Nonfinite RTC correction')
-    if norm >= 1e-8:
-        correction = alpha*error.norm()/(t*norm)*correction
-    else:
-        correction = torch.zeros_like(correction)
+    # Keep the near-zero branch on device; preserve the original threshold.
+    safe_norm = norm.clamp_min(1e-8)
+    scaled = alpha*error.norm()/(t*safe_norm)*correction
+    correction = torch.where(norm >= 1e-8, scaled, torch.zeros_like(correction))
     return v.detach()-correction.to(v.dtype)
 
 
@@ -62,6 +64,7 @@ class RTCActionHead:
         if tuple(previous.shape) != shape or not torch.isfinite(previous).all():
             raise ValueError('Invalid normalized previous action block')
         mask = soft_mask(shape[1], inference_delay, execution_horizon, device=vl_embs.device)
+        mask_nonzero = bool(mask.any())
         features = vl_embs.detach()
         with torch.no_grad():
             sf = h.state_encoder(state.detach()) if state is not None else None
@@ -82,7 +85,8 @@ class RTCActionHead:
             raise ValueError('Invalid checkpoint inference steps')
         for i in range(steps):
             t = 1-i/float(steps)
-            v = guided_velocity(velocity, actions, t, previous, mask, guidance_alpha)
+            v = guided_velocity(velocity, actions, t, previous, mask, guidance_alpha,
+                                mask_nonzero=mask_nonzero)
             actions = (actions-v/steps).detach()
             if not torch.isfinite(actions).all():
                 raise ValueError('Nonfinite sampled actions')

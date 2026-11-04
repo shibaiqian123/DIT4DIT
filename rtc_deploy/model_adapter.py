@@ -78,13 +78,18 @@ class Policy:
         self.prompt_cache_enabled = os.environ.get('RTC_DISABLE_PROMPT_CACHE') != '1'
         if self.prompt_cache_enabled:
             install_prompt_cache(self.model.backbone_interface.extractor)
+        self.feature_early_exit = os.environ.get('RTC_FEATURE_EARLY_EXIT') == '1'
+        extractor = self.model.backbone_interface.extractor
+        if self.feature_early_exit and not hasattr(extractor, '_transformer_feature_call'):
+            raise RuntimeError('Update Cosmos25.py before enabling feature early exit')
+        extractor.feature_early_exit = self.feature_early_exit
         self.rtc = RTCActionHead(self.model.action_model)
         self.info = dict(checkpoint=str(ckpt), checkpoint_sha256=sha(ckpt),
                          config_sha256=sha(run/'config.yaml'), statistics_sha256=sha(run/'dataset_statistics.json'),
                          cosmos=str(Path(cosmos).resolve()), action_shape=[50,66], token_shape=[50,64],
                          state_dim=31, inference_steps=self.model.action_model.num_inference_timesteps,
                          rtc_mode='test_time', guidance_alpha=0.9, seed=seed,
-                         prompt_cache_enabled=self.prompt_cache_enabled)
+                         feature_early_exit=self.feature_early_exit, prompt_cache_enabled=self.prompt_cache_enabled)
 
     def example(self, obs):
         state = np.asarray(obs['state'], dtype=np.float32)
@@ -94,7 +99,21 @@ class Policy:
             raise ValueError('Task instruction required')
         if not np.isfinite(float(obs['observed_at'])) or not isinstance(obs['observation_id'], str):
             raise ValueError('Observation identity/timestamp required')
-        image = Image.open(io.BytesIO(base64.b64decode(obs['image_png'], validate=True))).convert('RGB')
+        encoding = obs.get('image_encoding', 'png')
+        if encoding == 'rgb8_base64':
+            if obs.get('image_shape') != [224, 224, 3]:
+                raise ValueError('Expected RGB uint8 shape [224,224,3]')
+            wire = obs['image_rgb']
+            if not isinstance(wire, str) or len(wire) != 200704:
+                raise ValueError('Invalid RGB payload length')
+            raw = base64.b64decode(wire, validate=True)
+            if len(raw) != 224*224*3:
+                raise ValueError('Invalid RGB byte count')
+            image = Image.fromarray(np.frombuffer(raw, dtype=np.uint8).reshape(224,224,3))
+        elif encoding == 'png':
+            image = Image.open(io.BytesIO(base64.b64decode(obs['image_png'], validate=True))).convert('RGB')
+        else:
+            raise ValueError('Unsupported image encoding')
         if image.size != (224,224):
             image = image.resize((224,224), Image.Resampling.BILINEAR)
         lo, hi = [np.asarray(self.stats['state'][key]) for key in ('min','max')]

@@ -96,3 +96,46 @@ Set the229 readonly client to `--url ws://127.0.0.1:8014/ws --action-exec-horizo
 
 Validation on 229: syntax/help checks, no await under shared lock, CPU fake prompt-cache equality/invalidation, full/minimal recorder retention and unchanged infeasible-overlap rejection. No real-camera/DDS/motor execution. Real-checkpoint latency and output equivalence remain unmeasured.
 For a read-only A/B, use the same saved observations/checkpoint/noise, keep full input records, separate warmup, compare request RTT and inference p50/p95/max plus overlap failures. Do not run an additional benchmark against a server controlling a robot. 32 receives changes only through Git; an already running server is not updated by pulling.
+
+## Optional compute and wire optimizations (2026-11-04, second pass)
+
+RTC sampling now computes the mask-presence predicate once per chunk and keeps
+near-zero VJP normalization on device. Finite-value checks and the original
+threshold remain in place. No horizon, timeout, freshness, joint or gripper
+constraint is relaxed.
+
+The following options are deliberately opt-in; existing launch commands and
+full replies remain compatible:
+
+- Server: `RTC_FEATURE_EARLY_EXIT=1` enables inference-only Cosmos feature-prefix
+  execution. With extract_layer=17 this stops after block18 instead of executing
+  all28 blocks and the output head. It requires a frozen eval extractor, capture
+  at the first step, and no generated-video/future-loss request. The original
+  training and video-generation paths remain unchanged. `/info` reports
+  `feature_early_exit`. Keep this off until same-checkpoint, same-input/noise
+  feature and final-action parity has been checked offline on the target GPU.
+- Live/readonly sensor client: `--image-transport rgb` sends the same resized
+  224x224 RGB uint8 pixels as base64 raw bytes instead of PNG. This avoids PNG
+  compression/decompression but uses 200704 payload characters per observation;
+  bandwidth can outweigh the CPU savings. Camera JPEG decoding is unchanged.
+- Client: `--compact-replies` omits normalized50x66 from replies. The server
+  validates and retains that block for subsequent RTC guidance; clients still
+  validate the shape and finiteness of the transmitted token64 and gripper2.
+  The server advertises both wire capabilities in `/info`; unsupported requested
+  modes fail before creating execution publishers. Compact logs do not contain
+  normalized blocks, so use full replies when those are needed for diagnosis.
+- Existing `--diagnostics minimal` remains separate and optional. Keep full
+  diagnostics for replay capture. No new option enables robot execution by itself.
+
+Validation: existing10 CPU RTC tests on229 and4 in-memory service tests in a
+temporary local environment; compact/full reply and reconnect tests for both
+service copies;48 exact old/new guided-velocity comparisons
+and NaN rejection; fake28-block prefix equivalence/hook cleanup/training guard;
+PNG/raw pixel and state equality; compact reply negotiation, shape/finite checks
+and stale-session rejection. Temporary validation files are not part of the
+repository. These checks do not establish actual-checkpoint output equivalence,
+GPU speedup or real-robot stability. Run a read-only A/B before enabling an
+experimental path in execution; preserve identical inputs/noise and compare
+p50/p95/max plus expired/infeasible-overlap counts. An active server must be
+restarted by the operator after pulling to load new code; pulling alone does not
+change the running process.

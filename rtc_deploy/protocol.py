@@ -20,9 +20,10 @@ def shifted(previous, consumed, delay):
 
 
 class ConsumptionClock:
-    def __init__(self, session, horizon=25):
+    def __init__(self, session, horizon=25, *, allow_compact=False):
         if type(horizon) is not int or not 1 <= horizon < H:
             raise ValueError('Invalid action_exec_horizon')
+        self.allow_compact = allow_compact
         self.session, self.horizon = session, horizon
         self.chunk_id = None
         self.position = 0
@@ -64,7 +65,16 @@ class ConsumptionClock:
         if lag >= H:
             self.failed = True
             raise ValueError('Returned chunk already expired')
-        block(result['normalized'])
+        if result.get('reply_format') == 'actions_only_v1':
+            if not self.allow_compact or result.get('normalized_validated') is not True:
+                raise ValueError('Unnegotiated compact reply or missing server validation')
+            token = np.asarray(result.get('motion_tokens'), dtype=np.float32)
+            grip = np.asarray(result.get('gripper_actions'), dtype=np.float64)
+            if (token.shape != (H,64) or grip.shape != (H,2)
+                    or not np.isfinite(token).all() or not np.isfinite(grip).all()):
+                raise ValueError('Invalid compact action block')
+        else:
+            block(result['normalized'])
         if self.chunk_id is not None:
             self.delays.append(lag)
         self.chunk_id = result['chunk_id']

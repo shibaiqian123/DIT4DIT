@@ -167,6 +167,35 @@ class Cosmos25FeatureExtractor(nn.Module):
 
         self._hook_handle = target_layer.register_forward_hook(hook_fn)
 
+    def _transformer_feature_call(self, *, early_exit=False, **kwargs):
+        """Inference-only prefix execution; original capture hook runs first.
+
+        The temporary hook is always removed, including unexpected failures.
+        It must never be enabled when the final transformer output is needed.
+        """
+        if not early_exit:
+            return self.transformer(**kwargs)
+        if self.training or any(p.requires_grad for p in self.parameters()):
+            raise RuntimeError("Feature early exit requires a frozen eval extractor")
+        if self._hook_handle is None or not self._capture_hidden_enabled:
+            raise RuntimeError("Feature capture hook must be enabled before early exit")
+
+        class CapturedFeature(Exception):
+            pass
+
+        def stop_after_capture(module, args, output):
+            if not self._cached_hidden:
+                raise RuntimeError("No hidden feature captured before early exit")
+            raise CapturedFeature()
+
+        handle = self.transformer.transformer_blocks[self.extract_layer].register_forward_hook(stop_after_capture)
+        try:
+            return self.transformer(**kwargs)
+        except CapturedFeature:
+            return (None,)  # Final velocity is deliberately unused on this path.
+        finally:
+            handle.remove()
+
     def _get_prompt_embeds(
         self,
         prompt: Union[str, List[str]],
@@ -638,7 +667,12 @@ class Cosmos25FeatureExtractor(nn.Module):
                 in_latents = in_latents.to(transformer_dtype)
                 in_timestep = cond_indicator * cond_timestep + (1 - cond_indicator) * sigma_t
 
-                model_out = self.transformer(
+                feature_exit = (getattr(self, "feature_early_exit", False)
+                                and not self.training and detach
+                                and gt_future_videos is None and not return_pred_future_video
+                                and not need_generate and capture_step_index == 0)
+                model_out = self._transformer_feature_call(
+                    early_exit=feature_exit,
                     hidden_states=in_latents,
                     condition_mask=cond_mask_t,
                     timestep=in_timestep,
@@ -648,7 +682,7 @@ class Cosmos25FeatureExtractor(nn.Module):
                 )[0]
 
                 # Replace conditional-frame velocity with gt_velocity (diffusers behavior)
-                if gt_velocity is not None:
+                if gt_velocity is not None and model_out is not None:
                     model_out = gt_velocity + model_out * (1 - cond_mask_t)
 
 
