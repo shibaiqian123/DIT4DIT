@@ -37,22 +37,34 @@ def read_observation(capture):
 
 class Recorder:
     """Bounded disk worker: no file write/JSON serialization in the consumer tick."""
-    def __init__(self, output):
+    def __init__(self, output, mode='full'):
+        if mode not in ('full', 'minimal'): raise ValueError('Unknown diagnostics mode')
+        self.mode=mode
         self.output=output;self.q=queue.Queue(maxsize=4096);self.error=None
         self.thread=threading.Thread(target=self.work,daemon=True);self.thread.start()
     def work(self):
         try:
             with (self.output/'events.jsonl').open('w') as log:
+                last_flush=time.monotonic()
                 while True:
-                    item=self.q.get()
+                    try: item=self.q.get(timeout=.25)
+                    except queue.Empty:
+                        log.flush();last_flush=time.monotonic();continue
                     if item is None:return
                     name,data=item
                     if name is None:
-                        log.write(json.dumps(data)+'\n');log.flush()
+                        log.write(json.dumps(data)+'\n')
+                        if self.mode == 'full' or data.get('kind') == 'fault_locked' or time.monotonic()-last_flush >= .25:
+                            log.flush();last_flush=time.monotonic()
                     else:(self.output/name).write_text(json.dumps(data))
         except BaseException as e:self.error=e
     def add(self,name,data):
         if self.error:raise RuntimeError('Diagnostic writer failed') from self.error
+        if self.mode == 'minimal':
+            if name and (name.startswith('request_') or name.startswith('chunk_') or name == 'warmup_discarded.json'):
+                return
+            if name is None and 'token' in data:
+                data={k:v for k,v in data.items() if k != 'token'}
         self.q.put_nowait((name,data))
     def close(self):
         while self.thread.is_alive():

@@ -84,3 +84,15 @@ The existing `start_server.sh` now also accepts environment-only startup: explic
 Set the229 readonly client to `--url ws://127.0.0.1:8014/ws --action-exec-horizon 30` and tunnel8014 to8014. `/info` advertises the configured horizon and the server rejects premature replans. A window30 has20 frames remaining; previous validation used25, so it does not certify the30-frame real-network latency budget. Invalid delay/overlap still fails; no timeout is widened.
 
 `--host 0.0.0.0` is supported if deliberately exposing the server directly. This unauthenticated diagnostic endpoint defaults to loopback + SSH forwarding.
+
+
+## Deployment latency optimizations (2026-11-04)
+
+- Startup polling yields outside the shared lock; heartbeat and gripper workers retain access.
+- Frozen eval-mode prompt embeddings use a single-entry, per-model deployment cache. Set `RTC_DISABLE_PROMPT_CACHE=1` before server startup for an uncached baseline; `/info` reports `prompt_cache_enabled`. Model reload creates a new cache. Training code is unchanged.
+- Exact repeated camera frames reuse PNG encoding only when image identity and source timestamp match. Body/gripper validation and original image age are retained. Already-224x224 server images skip redundant resizing.
+- Live client `--diagnostics minimal` omits request image files, chunk dumps and per-frame token arrays, but retains frame indexes, ages, timing, stream changes and faults. Log flushes are batched up to 250 ms (fault/normal close flush); abrupt process termination may lose buffered lines. Default `full` retains replay inputs.
+- No freshness, overlap, gain, limits or control deadline changes. Disable producer tracing explicitly with `unset LATENCY_TRACE_HOST LATENCY_TRACE_UDP LATENCY_TRACE_EVERY`; commented exports do not clear inherited values.
+
+Validation on 229: syntax/help checks, no await under shared lock, CPU fake prompt-cache equality/invalidation, full/minimal recorder retention and unchanged infeasible-overlap rejection. No real-camera/DDS/motor execution. Real-checkpoint latency and output equivalence remain unmeasured.
+For a read-only A/B, use the same saved observations/checkpoint/noise, keep full input records, separate warmup, compare request RTT and inference p50/p95/max plus overlap failures. Do not run an additional benchmark against a server controlling a robot. 32 receives changes only through Git; an already running server is not updated by pulling.

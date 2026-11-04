@@ -2,6 +2,7 @@
 import base64
 import hashlib
 import io
+import os
 import json
 import time
 from pathlib import Path
@@ -19,6 +20,35 @@ def sha(path):
         for b in iter(lambda:f.read(4*1024*1024), b''):
             h.update(b)
     return h.hexdigest()
+
+
+def install_prompt_cache(extractor):
+    """Single-entry deployment cache. Never cache trainable/training encoders.
+
+    Instance lifetime ties the cache to the loaded checkpoint. Disable at startup
+    with RTC_DISABLE_PROMPT_CACHE=1 for same-noise comparisons.
+    """
+    original = extractor._get_prompt_embeds
+    cached_key = cached_value = None
+
+    def get_prompt_embeds(prompt, *, device, dtype, max_sequence_length):
+        nonlocal cached_key, cached_value
+        encoder = extractor.text_encoder
+        if encoder.training or any(p.requires_grad for p in encoder.parameters()):
+            cached_key = cached_value = None
+            return original(prompt, device=device, dtype=dtype,
+                            max_sequence_length=max_sequence_length)
+        prompts = (prompt,) if isinstance(prompt, str) else tuple(prompt)
+        key = (prompts, str(device), dtype, max_sequence_length)
+        if key != cached_key:
+            with torch.no_grad():
+                value = original(prompt, device=device, dtype=dtype,
+                                 max_sequence_length=max_sequence_length)
+            cached_value = value.detach()
+            cached_key = key
+        return cached_value
+
+    extractor._get_prompt_embeds = get_prompt_embeds
 
 
 class Policy:
@@ -45,12 +75,16 @@ class Policy:
         self.model.load_state_dict(sd, strict=True)
         del sd
         self.model.eval().requires_grad_(False).to(device='cuda', dtype=torch.bfloat16)
+        self.prompt_cache_enabled = os.environ.get('RTC_DISABLE_PROMPT_CACHE') != '1'
+        if self.prompt_cache_enabled:
+            install_prompt_cache(self.model.backbone_interface.extractor)
         self.rtc = RTCActionHead(self.model.action_model)
         self.info = dict(checkpoint=str(ckpt), checkpoint_sha256=sha(ckpt),
                          config_sha256=sha(run/'config.yaml'), statistics_sha256=sha(run/'dataset_statistics.json'),
                          cosmos=str(Path(cosmos).resolve()), action_shape=[50,66], token_shape=[50,64],
                          state_dim=31, inference_steps=self.model.action_model.num_inference_timesteps,
-                         rtc_mode='test_time', guidance_alpha=0.9, seed=seed)
+                         rtc_mode='test_time', guidance_alpha=0.9, seed=seed,
+                         prompt_cache_enabled=self.prompt_cache_enabled)
 
     def example(self, obs):
         state = np.asarray(obs['state'], dtype=np.float32)
@@ -61,7 +95,8 @@ class Policy:
         if not np.isfinite(float(obs['observed_at'])) or not isinstance(obs['observation_id'], str):
             raise ValueError('Observation identity/timestamp required')
         image = Image.open(io.BytesIO(base64.b64decode(obs['image_png'], validate=True))).convert('RGB')
-        image = image.resize((224,224), Image.Resampling.BILINEAR)
+        if image.size != (224,224):
+            image = image.resize((224,224), Image.Resampling.BILINEAR)
         lo, hi = [np.asarray(self.stats['state'][key]) for key in ('min','max')]
         if lo.shape != (31,) or hi.shape != (31,) or not np.isfinite([lo,hi]).all():
             raise ValueError('Invalid state statistics')
