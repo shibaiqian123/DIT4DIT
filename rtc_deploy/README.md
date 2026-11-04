@@ -139,3 +139,71 @@ experimental path in execution; preserve identical inputs/noise and compare
 p50/p95/max plus expired/infeasible-overlap counts. An active server must be
 restarted by the operator after pulling to load new code; pulling alone does not
 change the running process.
+
+## Independent-GPU input / future-video viewer
+
+`serve_preview.py` is an optional diagnostic process on32. The RTC server exposes
+one latest inference-input snapshot only when started with `--enable-preview-source`.
+The viewer polls this snapshot, uses a separate GPU/model/RNG, and never sends
+robot actions. It has no video queue: intermediate inputs are skipped while a
+video is generating. Both services must use a single full GPU UUID, and different
+UUIDs. Checkpoint, config and statistics hashes must match. This consumes another
+model's GPU memory; independently select an available GPU, not a training GPU.
+Shared CPU/network overhead is still possible; this is not a zero-latency claim.
+
+1. On32 keep the existing RTC launch options and add `--enable-preview-source`.
+   Keep `CUDA_VISIBLE_DEVICES` set to the full UUID of the action GPU. Restart the
+   action service only after stopping the robot/client through the existing flow.
+2. In another32 terminal activate the same `.venv_rtc_deploy` environment and set
+   `CHECKPOINT_DIR` and `CHECKPOINT_STEP` to exactly those used by the action
+   service. Choose a different available GPU using `nvidia-smi -L`, then run:
+
+   ```bash
+   cd /share/2025slx/DIT4DIT
+   source .venv_rtc_deploy/bin/activate
+   export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+   export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+   # Set PREVIEW_GPU_UUID to the other available GPU's complete UUID first.
+   python rtc_deploy/serve_preview.py \
+     --run-dir "${CHECKPOINT_DIR:?Set the same run as RTC}" \
+     --ckpt-step "${CHECKPOINT_STEP:?Set the same step as RTC}" \
+     --cosmos /share/2025slx/models/Cosmos-Predict2.5-2B \
+     --gpu-uuid "${PREVIEW_GPU_UUID:?Set a different available GPU UUID}" \
+     --source-url http://127.0.0.1:8014 \
+     --port 8015 --playback-fps 10
+   ```
+
+3. On229 keep the existing8014 action tunnel, and open an additional terminal:
+
+   ```bash
+   ssh -N -T -o ExitOnForwardFailure=yes \
+     -L 127.0.0.1:8015:127.0.0.1:8015 2025slx@10.246.1.32
+   ```
+
+4. Open `http://127.0.0.1:8015/` in a229 browser. Start with the existing client in
+   read-only mode (omit `--execute`). No new live-client arguments are needed.
+   A frame appears only after an actual RTC request supplies a complete input.
+
+The left panel holds the input frame corresponding to the video on the right;
+it is not a separate live-camera feed. The right panel includes the conditional
+frame and loops the generated clip. `--playback-fps` changes display speed only;
+it does not infer physical timing. The page labels observation/request identity,
+generation duration, input-snapshot age and result age. It shows unavailable/error
+and stops playback when the source disconnects or goes stale. Late results from
+an old RTC session are discarded. It does not replay past gripper/body commands.
+Video generation is independent of RTC action sampling: the prediction is not a
+rendering of the emitted50x66 action block or evidence of robot task success.
+
+The explicit `predict_future=True` backbone path now correctly requests video
+from the extractor. Default action feature extraction and the existing training
+future-loss branch keep their prior video-return settings. Video generation uses
+the checkpoint's configured future sampling steps and frame count; feature early
+exit does not apply to this video path. No denoising-step increase is introduced.
+
+Validation: syntax/help;4 original mock service tests;4 additional in-memory
+checks covering GPU/resource guards, default-off source snapshots, pairing and
+old-session result discard; fake-extractor branch checks on229. No new repository
+test programs, real GPU generation, camera/DDS or motor validation were run.
+Actual video quality, generation latency and shared-host impact remain unmeasured.
+All implementation edits are on229;32 receives Git pulls only. This section does
+not mean the code has already been pushed, pulled or loaded by a running service.

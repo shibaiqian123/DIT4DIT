@@ -87,6 +87,7 @@ class Policy:
         self.info = dict(checkpoint=str(ckpt), checkpoint_sha256=sha(ckpt),
                          config_sha256=sha(run/'config.yaml'), statistics_sha256=sha(run/'dataset_statistics.json'),
                          cosmos=str(Path(cosmos).resolve()), action_shape=[50,66], token_shape=[50,64],
+                         cuda_visible_devices=os.environ.get('CUDA_VISIBLE_DEVICES', ''),
                          state_dim=31, inference_steps=self.model.action_model.num_inference_timesteps,
                          rtc_mode='test_time', guidance_alpha=0.9, seed=seed,
                          feature_early_exit=self.feature_early_exit, prompt_cache_enabled=self.prompt_cache_enabled)

@@ -4,17 +4,19 @@ from latency_trace import mark, stamp
 import asyncio
 import json
 import uuid
+import time
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 import uvicorn
 from protocol import shifted, block
 
 
-def create_app(policy, action_exec_horizon=25):
+def create_app(policy, action_exec_horizon=25, *, enable_preview_source=False):
     if not 1 <= action_exec_horizon < 50:
         raise ValueError("action_exec_horizon must be 1..49")
     app = FastAPI()
     gpu_lock = asyncio.Lock()
     owner = None
+    preview_latest = None
 
     @app.get('/health')
     async def health():
@@ -24,16 +26,35 @@ def create_app(policy, action_exec_horizon=25):
     async def info():
         return dict(policy.info, action_exec_horizon_default=action_exec_horizon, control_hz=50,
                     timing='229_client_consumption_not_motor_ack', rtc_supported=True,
-                    image_encodings=['png', 'rgb8_base64'], reply_formats=['full', 'actions_only_v1'])
+                    image_encodings=['png', 'rgb8_base64'], reply_formats=['full', 'actions_only_v1'],
+                    preview_source_enabled=enable_preview_source)
+
+    @app.get('/preview-observation')
+    async def preview_observation(after: str = ''):
+        # Pull-only diagnostic snapshot; action inference never waits for a viewer.
+        if not enable_preview_source:
+            return dict(enabled=False, active=False)
+        if owner is None or preview_latest is None:
+            return dict(enabled=True, active=False)
+        age = time.monotonic()-preview_latest['received_mono']
+        if age > 5:
+            return dict(enabled=True, active=False, source_age_seconds=age)
+        result = dict(enabled=True, active=True, key=preview_latest['key'],
+                      source_age_seconds=age, resources=policy.info)
+        if after != preview_latest['key']:
+            result.update(observation=preview_latest['observation'],
+                          request_id=preview_latest['request_id'], session=preview_latest['session'])
+        return result
 
     @app.websocket('/ws')
     async def ws(socket: WebSocket):
-        nonlocal owner
+        nonlocal owner, preview_latest
         await socket.accept()
         if owner is not None:
             await socket.close(code=1013, reason='An inference client is already connected')
             return
         owner = socket
+        preview_latest = None
         pending = asyncio.Queue(maxsize=1)
         busy = False
         latest_obs = None
@@ -78,7 +99,7 @@ def create_app(policy, action_exec_horizon=25):
                 busy = True
                 pending.put_nowait(r)
         async def worker():
-            nonlocal previous, chunk_id, busy, last_consumed
+            nonlocal previous, chunk_id, busy, last_consumed, preview_latest
             while True:
                 r = await pending.get()
                 obs = r['observation']
@@ -96,6 +117,9 @@ def create_app(policy, action_exec_horizon=25):
                         if s < last_consumed:
                             raise ValueError('Consumption regressed')
                         prefix = shifted(previous, s, d)
+                    if enable_preview_source:
+                        preview_latest = dict(key=session+':'+r['request_id'], session=session,
+                            request_id=r['request_id'], observation=obs, received_mono=time.monotonic())
                     async with gpu_lock:
                         task = asyncio.create_task(asyncio.to_thread(policy.predict, obs, prefix, d, s))
                         try:
@@ -161,6 +185,8 @@ def parse_args(argv=None):
     p.add_argument('--host', default='127.0.0.1')
     p.add_argument('--action_exec_horizon', '--action-exec-horizon', type=int, default=25)
     p.add_argument('--policy', choices=['dit4dit'], default='dit4dit')
+    p.add_argument('--enable-preview-source', action='store_true',
+                   help='Expose latest inference input to a separate loopback preview GPU service')
     p.add_argument('--rtc', action='store_true', help='Explicit test-time RTC selection (also the default)')
     a = p.parse_args(argv)
     if not 1 <= a.action_exec_horizon < 50:
@@ -179,7 +205,7 @@ def main():
     from model_adapter import Policy
     policy = Policy(a.run, a.checkpoint, a.cosmos)
     print('RTC_READY '+json.dumps(policy.info), flush=True)
-    uvicorn.run(create_app(policy, a.action_exec_horizon), host=a.host, port=a.port, ws_max_size=16*1024*1024)
+    uvicorn.run(create_app(policy, a.action_exec_horizon, enable_preview_source=a.enable_preview_source), host=a.host, port=a.port, ws_max_size=16*1024*1024)
 
 if __name__ == '__main__':
     main()

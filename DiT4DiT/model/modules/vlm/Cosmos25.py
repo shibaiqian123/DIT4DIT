@@ -1097,7 +1097,7 @@ class _Cosmos25_Interface(nn.Module):
                 width=width,
                 detach=True,
                 gt_future_videos=future_videos,
-                return_pred_future_video=False,
+                return_pred_future_video=bool(predict_future),
                 num_inference_steps=future_steps,
                 num_frames_out=train_num_frames_out,
                 conditional_frame_timestep=conditional_frame_timestep,
