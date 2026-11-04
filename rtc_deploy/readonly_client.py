@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 import websockets
-from protocol import ConsumptionClock, H, HZ
+from protocol import ConsumptionClock, H, HZ, rtc_enabled_from_info
 
 
 def read_observation(capture):
@@ -79,9 +79,19 @@ class Recorder:
 
 async def run(a):
     observation = read_observation(a.capture)
-    clock = ConsumptionClock(uuid.uuid4().hex, a.action_exec_horizon)
+    import urllib.parse, urllib.request
+    u = urllib.parse.urlsplit(a.url)
+    info_url = urllib.parse.urlunsplit(('https' if u.scheme == 'wss' else 'http', u.netloc, '/info', '', ''))
+    def get_info():
+        with urllib.request.urlopen(info_url, timeout=10) as response:
+            return json.load(response)
+    info = await asyncio.to_thread(get_info)
+    rtc_enabled = rtc_enabled_from_info(info)
+    clock = ConsumptionClock(uuid.uuid4().hex, a.action_exec_horizon, rtc_enabled=rtc_enabled)
+    print('SAMPLING_MODE: '+info['rtc_mode'], flush=True)
     a.output.mkdir(parents=True, exist_ok=False)
     recorder=Recorder(a.output)
+    recorder.add("session.json", dict(server=info, motor_send=False))
     def emit(kind, **fields):
         recorder.add(None,dict(kind=kind,time=time.monotonic(),**fields))
     try:
@@ -138,7 +148,7 @@ async def run(a):
                             if blocks>=a.blocks:
                                 emit('complete',blocks=blocks,motor_send=False)
                                 break
-                            request()
+                            if clock.ready_to_request(): request()
                     await asyncio.sleep(.001)
             except Exception as e:
                 emit('failed',error=str(e),motor_send=False)

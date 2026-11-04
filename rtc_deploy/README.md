@@ -207,3 +207,49 @@ test programs, real GPU generation, camera/DDS or motor validation were run.
 Actual video quality, generation latency and shared-host impact remain unmeasured.
 All implementation edits are on229;32 receives Git pulls only. This section does
 not mean the code has already been pushed, pulled or loaded by a running service.
+
+## Disable RTC guidance while retaining asynchronous delivery
+
+Use `--no-rtc` instead of `--rtc` on the action server. The options are mutually
+exclusive. Omitting both preserves the previous default (RTC enabled).
+
+```bash
+python rtc_deploy/serve.py \
+  --host 127.0.0.1 --port 8014 \
+  --action_exec_horizon 10 --policy dit4dit --no-rtc \
+  --enable-preview-source \
+  --run-dir "$CHECKPOINT_DIR" --ckpt-step "$CHECKPOINT_STEP" \
+  --cosmos /share/2025slx/models/Cosmos-Predict2.5-2B
+```
+
+This command is for the32 inference checkout; the mirrored229 source entry is
+`dit4dit/src/deploy/serve.py`. Keep the checkpoint, environment and full action-GPU
+UUID unchanged. Stop the active robot/client through the existing flow before
+restarting a server; the flag does not switch a running session in place.
+
+`/info` must report `rtc_mode: "disabled"` and `rtc_enabled: false`.
+`rtc_supported: true` is capability metadata, not an enabled-state indicator.
+Every request now runs the original `model.predict_action`, including subsequent
+chunks. There is no history-prefix guidance or VJP on this path, and the server
+does not retain normalized history for RTC. Checkpoint loading, normalization,
+64+2 action semantics and sampling step counts are unchanged.
+
+The updated live and saved-observation clients read the mode from `/info` and
+print `SAMPLING_MODE: disabled`; their launch commands do not need `--no-rtc`.
+Update both client and server: old clients reject disabled mode. The ordinary
+mode triggers replanning after `action_exec_horizon` consumed frames without
+RTC-only d/s soft-mask overlap requirements. It still permits only one in-flight
+request, skips the prefix elapsed during inference, rejects wrong-session/mode
+replies, and stops on exhaustion or expired blocks. Existing live-observation
+freshness, whole-tick deadlines, gripper limits and fault holding are unchanged.
+Disabling RTC is not synchronous execution, nor a guarantee of chunk continuity.
+
+The independent-GPU video service and its source endpoint remain compatible.
+This mode changes action sampling only, not future-video generation.
+
+Validation (no hardware/model checkpoint run):10 existing CPU RTC tests;
+4 existing mock service tests;7 added temporary mode/clock/service checks on
+each deployment copy; fake Policy calls proving every no-RTC request selects
+ordinary sampling, plus live-client metadata validation. No repository test
+programs were added. Actual checkpoint latency, boundary continuity and physical
+behavior remain unmeasured. All edits are made on229;32 receives Git pulls only.

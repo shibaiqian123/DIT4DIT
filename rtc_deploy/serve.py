@@ -13,6 +13,10 @@ from protocol import shifted, block
 def create_app(policy, action_exec_horizon=25, *, enable_preview_source=False):
     if not 1 <= action_exec_horizon < 50:
         raise ValueError("action_exec_horizon must be 1..49")
+    mode = policy.info.get('rtc_mode', 'test_time')
+    if mode not in ('test_time', 'disabled'):
+        raise ValueError('Unknown policy RTC mode')
+    rtc_enabled = mode == 'test_time'
     app = FastAPI()
     gpu_lock = asyncio.Lock()
     owner = None
@@ -25,7 +29,7 @@ def create_app(policy, action_exec_horizon=25, *, enable_preview_source=False):
     @app.get('/info')
     async def info():
         return dict(policy.info, action_exec_horizon_default=action_exec_horizon, control_hz=50,
-                    timing='229_client_consumption_not_motor_ack', rtc_supported=True,
+                    timing='229_client_consumption_not_motor_ack', rtc_supported=True, rtc_enabled=rtc_enabled,
                     image_encodings=['png', 'rgb8_base64'], reply_formats=['full', 'actions_only_v1'],
                     preview_source_enabled=enable_preview_source)
 
@@ -105,9 +109,11 @@ def create_app(policy, action_exec_horizon=25, *, enable_preview_source=False):
                 obs = r['observation']
                 try:
                     s, d = r['consumed'], r['delay']
+                    if type(s) is not int or type(d) is not int or not (0 <= s < 50 and 0 <= d < 50):
+                        raise ValueError('Invalid consumption/delay frames')
                     if r.get('chunk_id') != chunk_id:
                         raise ValueError('Unknown previous chunk')
-                    if previous is None:
+                    if chunk_id is None:
                         if s != 0:
                             raise ValueError('First request consumed must be zero')
                         prefix = None
@@ -116,7 +122,7 @@ def create_app(policy, action_exec_horizon=25, *, enable_preview_source=False):
                             raise ValueError('Replan before configured action_exec_horizon')
                         if s < last_consumed:
                             raise ValueError('Consumption regressed')
-                        prefix = shifted(previous, s, d)
+                        prefix = shifted(previous, s, d) if rtc_enabled else None
                     if enable_preview_source:
                         preview_latest = dict(key=session+':'+r['request_id'], session=session,
                             request_id=r['request_id'], observation=obs, received_mono=time.monotonic())
@@ -129,7 +135,8 @@ def create_app(policy, action_exec_horizon=25, *, enable_preview_source=False):
                             await task
                             raise
                     import numpy as np
-                    previous = block(result['normalized']).copy()
+                    validated = block(result['normalized'])
+                    previous = validated.copy() if rtc_enabled else None
                     reply_format = r.get('reply_format', 'full')
                     if reply_format not in ('full', 'actions_only_v1'):
                         raise ValueError('Unsupported reply format')
@@ -187,7 +194,10 @@ def parse_args(argv=None):
     p.add_argument('--policy', choices=['dit4dit'], default='dit4dit')
     p.add_argument('--enable-preview-source', action='store_true',
                    help='Expose latest inference input to a separate loopback preview GPU service')
-    p.add_argument('--rtc', action='store_true', help='Explicit test-time RTC selection (also the default)')
+    modes = p.add_mutually_exclusive_group()
+    modes.add_argument('--rtc', dest='rtc_enabled', action='store_true', help='Enable test-time RTC (default)')
+    modes.add_argument('--no-rtc', dest='rtc_enabled', action='store_false', help='Ordinary sampling for every chunk; keep async delivery')
+    p.set_defaults(rtc_enabled=True)
     a = p.parse_args(argv)
     if not 1 <= a.action_exec_horizon < 50:
         p.error('action_exec_horizon must be 1..49')
@@ -203,7 +213,7 @@ def main():
     with socket.socket() as probe:
         probe.bind((a.host, a.port))
     from model_adapter import Policy
-    policy = Policy(a.run, a.checkpoint, a.cosmos)
+    policy = Policy(a.run, a.checkpoint, a.cosmos, rtc_enabled=a.rtc_enabled)
     print('RTC_READY '+json.dumps(policy.info), flush=True)
     uvicorn.run(create_app(policy, a.action_exec_horizon, enable_preview_source=a.enable_preview_source), host=a.host, port=a.port, ws_max_size=16*1024*1024)
 
