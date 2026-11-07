@@ -310,3 +310,57 @@ premature requests and existing asynchronous/RTC behavior. No camera/DDS/motor
 process was started. Real-checkpoint latency and hardware behavior are unverified.
 Changes are prepared on 229 only; synchronize the server checkout to 32 through
 the existing Git workflow and restart the service before using --sync.
+
+
+## Save actions and generate matched videos after a run (2026-11-07)
+
+Keep the live SONIC client in `--diagnostics full` (the default). Its `--output`
+directory stores `session.json`, `request_*.json` (actual model input images,
+raw state and prompt), `chunk_*.json` (all 50 predicted actions), and
+`events.jsonl` (consumed indices, prefill/wait delivery and faults). Close the
+client gracefully to drain its disk writer before copying/exporting the directory.
+Do not export a recording while it is still being written.
+
+`export_prediction_recording.py` is a separate offline GPU job. Copy the entire
+closed client output directory to the inference machine and use the exact same
+run config, checkpoint step and statistics as the recorded run. All three hashes
+are checked before accepting a pairing. It does not query a running server or
+start camera, DDS, SONIC or motor processes. Synchronize code from 229 to 32 using
+the existing Git workflow first; no deployment on 32 was done by this change.
+
+Example on 32 (RECORDING_DIR is the transferred client output directory):
+
+```bash
+python rtc_deploy/export_prediction_recording.py \
+  --recording "$RECORDING_DIR" \
+  --output "${RECORDING_DIR}_videos" \
+  --run-dir "$CHECKPOINT_DIR" --ckpt-step "$CHECKPOINT_STEP" \
+  --cosmos /share/2025slx/models/Cosmos-Predict2.5-2B --gpu 0
+```
+
+Use an available GPU after control has stopped, or a different idle GPU. The
+export directory must be new. Each numbered bundle contains `input.png`,
+`actions.csv` (50 rows, token64 + physical Dex1 left/right), `prediction.json`,
+`observation.json`, `delivery_events.jsonl`, `frames/*.jpg` (all generated preview
+frames), `generated.gif`, and `metadata.json`. The export uses the existing video
+preview renderer and its 224x224 JPEG frames. Playback defaults to 10 FPS and is
+only a display rate, not a physical timestamp correspondence.
+
+Match using session/request/observation identity, never nearby log times. Video
+is an independent offline generation from the exact saved input and matched
+checkpoint, not a reconstruction of the action forward pass's random state or
+an executed-action rollout. Video frame i is NOT assigned to action row i; the
+alignment field is explicitly null. Per-request seeds are saved. Actions are
+copied from the real recorded prediction, never regenerated. The metadata lists
+consumed action indices separately; delivery is not a motor acknowledgement.
+
+`report.json` lists completed bundles, failed pairs and requests without a saved
+reply. Saved discarded warmup results are exported too. Missing final replies,
+identity mismatches or generation failures produce `status=incomplete` and exit
+code 2 rather than silently omitting them. Completed bundles remain available.
+
+Validation on 229: seven CPU/synthetic-render tests in
+`python -m unittest test_prediction_recording -v`, including PNG/RGB inputs,
+compact action replies, GIF/frame export, consumption versus wait events, warmup,
+resource/observation mismatch and incomplete reporting. Real-checkpoint video
+rendering was not run; no new control latency or physical validation is claimed.
