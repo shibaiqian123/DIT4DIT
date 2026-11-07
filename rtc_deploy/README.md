@@ -255,14 +255,19 @@ programs were added. Actual checkpoint latency, boundary continuity and physical
 behavior remain unmeasured. All edits are made on229;32 receives Git pulls only.
 
 
-## Synchronous whole-chunk execution (2026-11-07)
+## Synchronous execution with selectable steps (2026-11-07)
 
-Start the server with `--sync` (implies `--no-rtc`, sets execution horizon to 50).
+Start the server with `--sync` (implies `--no-rtc`). Add `--sync-steps N` to
+execute the first N rows of each prediction; N is an integer from 1 to 50, default
+50. For example `--sync --sync-steps 25` executes rows 0..24; 30 executes 0..29.
+The remaining predicted rows are discarded. `--sync-steps` without `--sync` and
+values outside 1..50 are rejected. In sync mode this setting determines the
+execution length instead of `--action_exec_horizon`.
 `--sync --rtc` is rejected. `--no-rtc` alone still uses asynchronous consumption.
 The trained output remains 50x66; this option does not change model horizon or weights.
-`/info` advertises `execution_mode=sync` and `action_exec_horizon_default=50`.
+`/info` advertises `execution_mode=sync` and `action_exec_horizon_default=N`.
 Requests must declare `execution_mode=sync`; after the first request they require
-`consumed=50, delay=0`. Old asynchronous clients are rejected rather than silently
+`consumed=N, delay=0`. Old asynchronous clients are rejected rather than silently
 changing execution semantics. The existing `readonly_client.py` does not implement
 this sync mode; use the updated SONIC client without `--execute` for live-input
 read-only consumption.
@@ -282,12 +287,12 @@ while waiting. That reference uses WBC actions, not the SONIC token client.
 This adaptation uses the same whole-sequence scheduling, not its robot-specific
 WBC controls or virtual hand mapping.
 
-The updated client consumes rows 0..49 at 50 Hz, waits the last row's full tick,
+The updated client consumes rows 0..N-1 at 50 Hz, waits the last selected row's full tick,
 then requires image/body/gripper source timestamps newer than that boundary before
 requesting the next chunk. It consumes no new rows while inference is pending and
 starts each accepted chunk at row 0. Before the operator enables SONIC streaming,
 row 0 is published as prefill without consuming the block.
-During chunk gaps it repeats the last token and the last physical Dex1 target at
+During chunk gaps it repeats the last EXECUTED token and physical Dex1 target at
 50 Hz; events are marked `sync_wait_target`, not new model rows. Repeating a motion
 token does NOT guarantee a stationary pose. No new joint-position hold or motor
 acknowledgement is implemented. Faults, 10-second request timeout, source freshness,
@@ -295,10 +300,11 @@ CONTROL checks, gripper guards and control deadline checks remain active. The
 previously user-requested removal of the execution-time 1-second observation-age
 check in the SONIC client is preserved; reply-age validation remains active.
 
-Validation: 22 CPU fake-policy/protocol/service/RTC tests passed via
+Validation: 25 CPU fake-policy/protocol/service/RTC tests passed via
 `python -m unittest test_sync test_service test_launch test_rtc -v` here, plus two
 fake-time/fake-transport actual-client-loop tests (`test_sync_client`) in the
-SONIC client directory. Tests cover two/three full chunks, zero skipped prefixes,
+SONIC client directory (both cover N=1,25,30,50). Tests cover exact selected-prefix
+consumption, rejection of early/late requests and invalid N, zero skipped prefixes,
 fresh post-completion observations, prefill and wait targets, mode mismatch,
 premature requests and existing asynchronous/RTC behavior. No camera/DDS/motor
 process was started. Real-checkpoint latency and hardware behavior are unverified.

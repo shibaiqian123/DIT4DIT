@@ -63,6 +63,49 @@ class SyncTests(unittest.TestCase):
                     for _ in range(16): clock.consume()
                     self.assertTrue(clock.ready_to_request())
 
+    def test_selected_steps_contract(self):
+        base = ['--run-dir', '/fake', '--ckpt-step', '1', '--cosmos', '/fake']
+        for n in (1, 25, 30, 50):
+            with self.subTest(n=n):
+                self.assertEqual(parse_args(base + ['--sync', '--sync-steps', str(n)]).action_exec_horizon, n)
+                clock = ConsumptionClock('s', n, rtc_enabled=False, synchronous=True)
+                with TestClient(create_app(PlainPolicy(), n, synchronous=True)) as c, c.websocket_connect('/ws') as ws:
+                    self.assertEqual(c.get('/info').json()['action_exec_horizon_default'], n)
+                    for b in range(2):
+                        r = clock.request(str(b))
+                        self.assertEqual(r['consumed'], 0 if b == 0 else n)
+                        ws.send_json(dict(r, op='infer', observation=dict(observation_id=str(b), observed_at=1.)))
+                        self.assertTrue(clock.accept(ws.receive_json()))
+                        self.assertEqual(clock.position, 0)
+                        for i in range(n):
+                            self.assertFalse(clock.ready_to_request())
+                            self.assertEqual(clock.consume(), i)
+                        self.assertTrue(clock.ready_to_request())
+                    with self.assertRaises(ValueError): clock.consume()
+
+    def test_invalid_selected_steps(self):
+        import contextlib
+        import io
+        base = ['--run-dir', '/fake', '--ckpt-step', '1', '--cosmos', '/fake']
+        for args in (['--sync', '--sync-steps', '0'], ['--sync', '--sync-steps', '51'],
+                     ['--sync', '--sync-steps', '1.5'], ['--sync-steps', '25']):
+            with self.subTest(args=args), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                parse_args(base + args)
+        for n in (0, 51, True):
+            with self.subTest(n=n), self.assertRaises(ValueError):
+                ConsumptionClock('s', n, rtc_enabled=False, synchronous=True)
+
+    def test_selected_steps_server_rejects_wrong_boundary(self):
+        for n in (25, 30):
+            for consumed in (n-1, n+1, 50):
+                with self.subTest(n=n, consumed=consumed):
+                    with TestClient(create_app(PlainPolicy(), n, synchronous=True)) as c, c.websocket_connect('/ws') as ws:
+                        r = dict(op='infer', session='s', request_id='a', chunk_id=None, consumed=0,
+                                 delay=0, execution_mode='sync', observation=dict(observation_id='o', observed_at=1.))
+                        ws.send_json(r); first = ws.receive_json()
+                        ws.send_json(dict(r, request_id='b', chunk_id=first['chunk_id'], consumed=consumed))
+                        self.assertFalse(ws.receive_json()['ok'])
+
     def test_mode_and_exhaustion_checks(self):
         with self.assertRaises(ValueError): ConsumptionClock('s', 50, synchronous=True)
         with self.assertRaises(ValueError): create_app(FakePolicy(), 50, synchronous=True)
