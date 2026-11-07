@@ -253,3 +253,54 @@ each deployment copy; fake Policy calls proving every no-RTC request selects
 ordinary sampling, plus live-client metadata validation. No repository test
 programs were added. Actual checkpoint latency, boundary continuity and physical
 behavior remain unmeasured. All edits are made on229;32 receives Git pulls only.
+
+
+## Synchronous whole-chunk execution (2026-11-07)
+
+Start the server with `--sync` (implies `--no-rtc`, sets execution horizon to 50).
+`--sync --rtc` is rejected. `--no-rtc` alone still uses asynchronous consumption.
+The trained output remains 50x66; this option does not change model horizon or weights.
+`/info` advertises `execution_mode=sync` and `action_exec_horizon_default=50`.
+Requests must declare `execution_mode=sync`; after the first request they require
+`consumed=50, delay=0`. Old asynchronous clients are rejected rather than silently
+changing execution semantics. The existing `readonly_client.py` does not implement
+this sync mode; use the updated SONIC client without `--execute` for live-input
+read-only consumption.
+
+The current 229 launch script is
+`/home/cqu023/GR00T-WholeBodyControl/dit4dit/script/deploy_dit4dit-sonic-rtc-client.sh`.
+It defaults to the client under that repository's `dit4dit/src/deploy`; an explicit
+`DIT4DIT_DEPLOY_DIR` overrides this. That client automatically follows the server
+execution mode. Its protocol.py is an exact deployment copy of this directory's
+canonical protocol.py; keep the copy synchronized, do not develop separate protocols.
+
+Reference inspected on 229: Psi0 commit
+`2830f9367fc12ca49d9b4df4348726daae9db15d`, `real/deploy/psi-inference.py`:
+https://github.com/physical-superintelligence-lab/Psi0/blob/main/real/deploy/psi-inference.py
+Its request thread waits for sequence completion; control retains previous targets
+while waiting. That reference uses WBC actions, not the SONIC token client.
+This adaptation uses the same whole-sequence scheduling, not its robot-specific
+WBC controls or virtual hand mapping.
+
+The updated client consumes rows 0..49 at 50 Hz, waits the last row's full tick,
+then requires image/body/gripper source timestamps newer than that boundary before
+requesting the next chunk. It consumes no new rows while inference is pending and
+starts each accepted chunk at row 0. Before the operator enables SONIC streaming,
+row 0 is published as prefill without consuming the block.
+During chunk gaps it repeats the last token and the last physical Dex1 target at
+50 Hz; events are marked `sync_wait_target`, not new model rows. Repeating a motion
+token does NOT guarantee a stationary pose. No new joint-position hold or motor
+acknowledgement is implemented. Faults, 10-second request timeout, source freshness,
+CONTROL checks, gripper guards and control deadline checks remain active. The
+previously user-requested removal of the execution-time 1-second observation-age
+check in the SONIC client is preserved; reply-age validation remains active.
+
+Validation: 22 CPU fake-policy/protocol/service/RTC tests passed via
+`python -m unittest test_sync test_service test_launch test_rtc -v` here, plus two
+fake-time/fake-transport actual-client-loop tests (`test_sync_client`) in the
+SONIC client directory. Tests cover two/three full chunks, zero skipped prefixes,
+fresh post-completion observations, prefill and wait targets, mode mismatch,
+premature requests and existing asynchronous/RTC behavior. No camera/DDS/motor
+process was started. Real-checkpoint latency and hardware behavior are unverified.
+Changes are prepared on 229 only; synchronize the server checkout to 32 through
+the existing Git workflow and restart the service before using --sync.

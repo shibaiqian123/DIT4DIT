@@ -10,13 +10,17 @@ import uvicorn
 from protocol import shifted, block
 
 
-def create_app(policy, action_exec_horizon=25, *, enable_preview_source=False):
-    if not 1 <= action_exec_horizon < 50:
-        raise ValueError("action_exec_horizon must be 1..49")
+def create_app(policy, action_exec_horizon=25, *, enable_preview_source=False, synchronous=False):
+    if type(action_exec_horizon) is not int or not (1 <= action_exec_horizon <= 50 if synchronous else 1 <= action_exec_horizon < 50):
+        raise ValueError("action_exec_horizon must be 1..50 in sync mode, otherwise 1..49")
     mode = policy.info.get('rtc_mode', 'test_time')
     if mode not in ('test_time', 'disabled'):
         raise ValueError('Unknown policy RTC mode')
     rtc_enabled = mode == 'test_time'
+    if synchronous and rtc_enabled:
+        raise ValueError('Synchronous execution requires --no-rtc')
+    execution_mode = 'sync' if synchronous else 'async'
+    resources = dict(policy.info, execution_mode=execution_mode)
     app = FastAPI()
     gpu_lock = asyncio.Lock()
     owner = None
@@ -28,7 +32,7 @@ def create_app(policy, action_exec_horizon=25, *, enable_preview_source=False):
 
     @app.get('/info')
     async def info():
-        return dict(policy.info, action_exec_horizon_default=action_exec_horizon, control_hz=50,
+        return dict(resources, action_exec_horizon_default=action_exec_horizon, control_hz=50,
                     timing='229_client_consumption_not_motor_ack', rtc_supported=True, rtc_enabled=rtc_enabled,
                     image_encodings=['png', 'rgb8_base64'], reply_formats=['full', 'actions_only_v1'],
                     preview_source_enabled=enable_preview_source)
@@ -108,9 +112,13 @@ def create_app(policy, action_exec_horizon=25, *, enable_preview_source=False):
                 r = await pending.get()
                 obs = r['observation']
                 try:
+                    if r.get('execution_mode', 'async') != execution_mode:
+                        raise ValueError('Client/server execution mode mismatch')
                     s, d = r['consumed'], r['delay']
-                    if type(s) is not int or type(d) is not int or not (0 <= s < 50 and 0 <= d < 50):
+                    if type(s) is not int or type(d) is not int or not (0 <= s <= (50 if synchronous else 49) and 0 <= d < 50):
                         raise ValueError('Invalid consumption/delay frames')
+                    if synchronous and (d != 0 or s != (0 if chunk_id is None else action_exec_horizon)):
+                        raise ValueError('Sync requests require exactly the configured execution steps and zero delay')
                     if r.get('chunk_id') != chunk_id:
                         raise ValueError('Unknown previous chunk')
                     if chunk_id is None:
@@ -150,7 +158,7 @@ def create_app(policy, action_exec_horizon=25, *, enable_preview_source=False):
                     await send(dict(result, ok=True, session=session, request_id=r['request_id'],
                                     chunk_id=chunk_id, observation_id=obs['observation_id'],
                                     observed_at=obs['observed_at'], window_offset=s, estimated_delay=d,
-                                    resources=policy.info))
+                                    resources=resources))
                     busy = False
                 except Exception as e:
                     await send(dict(ok=False, session=session, request_id=r['request_id'], error=str(e)))
@@ -197,10 +205,22 @@ def parse_args(argv=None):
     modes = p.add_mutually_exclusive_group()
     modes.add_argument('--rtc', dest='rtc_enabled', action='store_true', help='Enable test-time RTC (default)')
     modes.add_argument('--no-rtc', dest='rtc_enabled', action='store_false', help='Ordinary sampling for every chunk; keep async delivery')
-    p.set_defaults(rtc_enabled=True)
+    p.add_argument('--sync', action='store_true', help='Execute the selected prefix before the next inference; implies --no-rtc')
+    p.add_argument('--sync-steps', type=int, default=None, metavar='N',
+                   help='Rows to execute per prediction in --sync mode (1..50, default 50); model still predicts 50 rows')
+    p.set_defaults(rtc_enabled=None)
     a = p.parse_args(argv)
-    if not 1 <= a.action_exec_horizon < 50:
-        p.error('action_exec_horizon must be 1..49')
+    if a.sync_steps is not None and (not a.sync or not 1 <= a.sync_steps <= 50):
+        p.error('--sync-steps requires --sync and must be 1..50')
+    if a.sync:
+        if a.rtc_enabled is True:
+            p.error('--sync cannot be combined with --rtc')
+        a.rtc_enabled = False
+        a.action_exec_horizon = 50 if a.sync_steps is None else a.sync_steps
+    else:
+        if a.rtc_enabled is None: a.rtc_enabled = True
+        if not 1 <= a.action_exec_horizon < 50:
+            p.error('action_exec_horizon must be 1..49')
     if a.ckpt_step is not None:
         if a.ckpt_step <= 0: p.error('ckpt-step must be positive')
         a.checkpoint = f'steps_{a.ckpt_step}_pytorch_model.pt'
@@ -215,7 +235,7 @@ def main():
     from model_adapter import Policy
     policy = Policy(a.run, a.checkpoint, a.cosmos, rtc_enabled=a.rtc_enabled)
     print('RTC_READY '+json.dumps(policy.info), flush=True)
-    uvicorn.run(create_app(policy, a.action_exec_horizon, enable_preview_source=a.enable_preview_source), host=a.host, port=a.port, ws_max_size=16*1024*1024)
+    uvicorn.run(create_app(policy, a.action_exec_horizon, enable_preview_source=a.enable_preview_source, synchronous=a.sync), host=a.host, port=a.port, ws_max_size=16*1024*1024)
 
 if __name__ == '__main__':
     main()

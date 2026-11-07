@@ -30,9 +30,12 @@ def rtc_enabled_from_info(info):
 
 
 class ConsumptionClock:
-    def __init__(self, session, horizon=25, *, allow_compact=False, rtc_enabled=True):
-        if type(horizon) is not int or not 1 <= horizon < H:
+    def __init__(self, session, horizon=25, *, allow_compact=False, rtc_enabled=True, synchronous=False):
+        if synchronous and rtc_enabled:
+            raise ValueError("Synchronous execution requires ordinary sampling")
+        if type(horizon) is not int or not (1 <= horizon <= H if synchronous else 1 <= horizon < H):
             raise ValueError('Invalid action_exec_horizon')
+        self.synchronous = synchronous
         self.rtc_enabled = rtc_enabled
         self.allow_compact = allow_compact
         self.session, self.horizon = session, horizon
@@ -51,6 +54,8 @@ class ConsumptionClock:
             return False
         if self.chunk_id is None:
             return True
+        if self.synchronous:
+            return self.position == self.horizon
         if not self.rtc_enabled:
             if self.position >= H:
                 raise ValueError('No valid action remains')
@@ -68,13 +73,17 @@ class ConsumptionClock:
             raise ValueError('Failed session or request already in flight')
         if self.chunk_id is not None and self.position < self.horizon:
             raise ValueError('Replan before execution horizon')
-        if self.chunk_id is not None and self.position >= H:
+        if self.synchronous and self.chunk_id is not None and self.position != self.horizon:
+            raise ValueError('Synchronous request must follow the configured number of rows')
+        if self.chunk_id is not None and self.position >= H and not (self.synchronous and self.position == self.horizon):
             raise ValueError('No valid action remains')
-        d = max(self.delays)
+        d = 0 if self.synchronous else max(self.delays)
         if self.rtc_enabled and self.chunk_id is not None:
             shifted(np.zeros((H,D)), self.position, d)
         req = dict(session=self.session, request_id=request_id, chunk_id=self.chunk_id,
                    consumed=self.position, delay=d)
+        if self.synchronous:
+            req['execution_mode'] = 'sync'
         self.pending = (request_id, self.total, self.chunk_id, self.position)
         return req
 
@@ -100,6 +109,8 @@ class ConsumptionClock:
             self.failed = True
             raise ValueError('Invalid new chunk identity')
         lag = self.total-self.pending[1]
+        if self.synchronous and (lag != 0 or result.get('resources', {}).get('execution_mode') != 'sync'):
+            raise ValueError('Synchronous reply mode/progress mismatch')
         if lag >= H:
             self.failed = True
             raise ValueError('Returned chunk already expired')
@@ -121,7 +132,8 @@ class ConsumptionClock:
         return True
 
     def consume(self):
-        if self.failed or self.chunk_id is None or self.position >= H:
+        limit = self.horizon if self.synchronous else H
+        if self.failed or self.chunk_id is None or self.position >= limit:
             self.failed = True
             raise ValueError('No valid action remains; no last-token repetition')
         index = self.position
